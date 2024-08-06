@@ -6,8 +6,8 @@ project "cppfront"
 	optimize "on"
 	staticruntime "off"
 		
-    targetdir 	("%{wks.location}/bin/%{prj.name}/" .. outputDir)
-    objdir 		("%{wks.location}/obj/%{prj.name}/" .. outputDir)
+    targetdir 	"%{wks.location}/bin/%{prj.name}/"
+    objdir 		"%{wks.location}/obj/%{prj.name}/"
 
     files 
     { 
