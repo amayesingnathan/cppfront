@@ -1,5 +1,6 @@
 
 #define CPP2_IMPORT_STD          Yes
+#include "cpp2regex.h"
 
 //=== Cpp2 type declarations ====================================================
 
@@ -8,7 +9,7 @@
 
 #line 1 "pure2-regex_18_branch_reset.cpp2"
 
-#line 153 "pure2-regex_18_branch_reset.cpp2"
+#line 165 "pure2-regex_18_branch_reset.cpp2"
 class test_tests_18_branch_reset;
   
 
@@ -18,13 +19,16 @@ class test_tests_18_branch_reset;
 [[nodiscard]] auto create_result(cpp2::impl::in<std::string> resultExpr, auto const& r) -> std::string;
 
 #line 112 "pure2-regex_18_branch_reset.cpp2"
+[[nodiscard]] auto sanitize(std::string str) -> std::string;
+
+#line 124 "pure2-regex_18_branch_reset.cpp2"
 template<typename M> auto test(M const& regex, cpp2::impl::in<std::string> id, cpp2::impl::in<std::string> regex_str, cpp2::impl::in<std::string> str, cpp2::impl::in<std::string> kind, cpp2::impl::in<std::string> resultExpr, 
            cpp2::impl::in<std::string> resultExpected) -> void;
 
-#line 153 "pure2-regex_18_branch_reset.cpp2"
+#line 165 "pure2-regex_18_branch_reset.cpp2"
 class test_tests_18_branch_reset {
 
-#line 169 "pure2-regex_18_branch_reset.cpp2"
+#line 181 "pure2-regex_18_branch_reset.cpp2"
   public: auto run() const& -> void;
   public: class regex_01_matcher {
   public: template<typename Iter, typename CharT> class wrap {
@@ -952,7 +956,7 @@ public: class func_1 {
   public: auto operator=(test_tests_18_branch_reset const&) -> void = delete;
 
 
-#line 188 "pure2-regex_18_branch_reset.cpp2"
+#line 200 "pure2-regex_18_branch_reset.cpp2"
 };
 auto main() -> int;
 
@@ -976,14 +980,14 @@ auto main() -> int;
    return CPP2_UFCS(cend)((*cpp2::impl::assert_not_null(_0))); 
   }
   }}; 
-  auto extract_group_and_advance {[](auto& iter) mutable -> auto{
+  auto extract_group_and_advance {[](auto& iter) -> auto{
     auto start {iter}; 
 
     for( ; std::isdigit(*cpp2::impl::assert_not_null(iter)); ++iter ) {}
 
     return std::stoi(std::string(cpp2::move(start), iter)); 
   }}; 
-  auto extract_until {[](auto& iter, cpp2::impl::in<char> to) mutable -> auto{
+  auto extract_until {[](auto& iter, cpp2::impl::in<char> to) -> auto{
     auto start {iter}; 
 
     for( ; (to != *cpp2::impl::assert_not_null(iter)); ++iter ) {}// TODO: Without bracket: error: postfix unary * (dereference) cannot be immediately followed by a (, identifier, or literal - add whitespace before * here if you meant binary * (multiplication)
@@ -1046,7 +1050,7 @@ auto main() -> int;
 
         if (*cpp2::impl::assert_not_null(next) == '-' || *cpp2::impl::assert_not_null(next) == '+') {
           auto i {0}; 
-          for( ; cpp2::impl::cmp_less(i,cpp2::unsafe_narrow<int>(CPP2_UFCS(group_number)(r))); ++i ) {
+          for( ; cpp2::impl::cmp_less(i,cpp2::unchecked_narrow<int>(CPP2_UFCS(group_number)(r))); ++i ) {
             auto pos {0}; 
             if (*cpp2::impl::assert_not_null(next) == '-') {
               pos = CPP2_UFCS(group_start)(r, i);
@@ -1072,6 +1076,19 @@ auto main() -> int;
 }
 
 #line 112 "pure2-regex_18_branch_reset.cpp2"
+[[nodiscard]] auto sanitize(std::string str) -> std::string
+{
+  str = cpp2::string_util::replace_all(str, "\a", "\\a");
+  str = cpp2::string_util::replace_all(str, "\f", "\\f");
+  str = cpp2::string_util::replace_all(str, "\x1b", "\\e");
+  str = cpp2::string_util::replace_all(str, "\n", "\\n");
+  str = cpp2::string_util::replace_all(str, "\r", "\\r");
+  str = cpp2::string_util::replace_all(str, "\t", "\\t");
+
+  return cpp2::move(str); 
+}
+
+#line 124 "pure2-regex_18_branch_reset.cpp2"
 template<typename M> auto test(M const& regex, cpp2::impl::in<std::string> id, cpp2::impl::in<std::string> regex_str, cpp2::impl::in<std::string> str, cpp2::impl::in<std::string> kind, cpp2::impl::in<std::string> resultExpr, 
            cpp2::impl::in<std::string> resultExpected) -> void{
 
@@ -1094,7 +1111,7 @@ template<typename M> auto test(M const& regex, cpp2::impl::in<std::string> id, c
       auto result {create_result(resultExpr, cpp2::move(r))}; 
 
       if (result != resultExpected) {
-        status = "Failure: Result is wrong. (is: " + cpp2::to_string(cpp2::move(result)) + ")";
+        status = "Failure: Result is wrong. (is: " + cpp2::to_string(sanitize(cpp2::move(result))) + ")";
       }
     }
   }
@@ -1109,10 +1126,10 @@ template<typename M> auto test(M const& regex, cpp2::impl::in<std::string> id, c
   if (!(CPP2_UFCS(empty)(warning))) {
     warning += " ";
   }
-  std::cout << "" + cpp2::to_string(id) + "_" + cpp2::to_string(kind) + ": " + cpp2::to_string(cpp2::move(status)) + " " + cpp2::to_string(cpp2::move(warning)) + "regex: " + cpp2::to_string(regex_str) + " parsed_regex: " + cpp2::to_string(CPP2_UFCS(to_string)(regex)) + " str: " + cpp2::to_string(str) + " result_expr: " + cpp2::to_string(resultExpr) + " expected_results " + cpp2::to_string(resultExpected) + "" << std::endl;
+  std::cout << "" + cpp2::to_string(id) + "_" + cpp2::to_string(kind) + ": " + cpp2::to_string(cpp2::move(status)) + " " + cpp2::to_string(cpp2::move(warning)) + "regex: " + cpp2::to_string(regex_str) + " parsed_regex: " + cpp2::to_string(CPP2_UFCS(to_string)(regex)) + " str: " + cpp2::to_string(sanitize(str)) + " result_expr: " + cpp2::to_string(resultExpr) + " expected_results " + cpp2::to_string(sanitize(resultExpected)) + "" << std::endl;
 }
 
-#line 169 "pure2-regex_18_branch_reset.cpp2"
+#line 181 "pure2-regex_18_branch_reset.cpp2"
   auto test_tests_18_branch_reset::run() const& -> void{
     std::cout << "Running tests_18_branch_reset:" << std::endl;
     test(regex_01, "01", R"((?|(a)))", "a", "y", R"($1-$+)", "a-a");
@@ -6993,7 +7010,7 @@ return -1;
 [[nodiscard]] auto test_tests_18_branch_reset::regex_15_matcher::to_string() -> std::string{return R"((?|(b)|()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()()(a)))"; }
 
 
-#line 189 "pure2-regex_18_branch_reset.cpp2"
+#line 201 "pure2-regex_18_branch_reset.cpp2"
 auto main() -> int{
     CPP2_UFCS(run)(test_tests_18_branch_reset());
 }

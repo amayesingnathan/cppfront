@@ -29,7 +29,7 @@ auto parser::apply_type_metafunctions( declaration_node& n )
     assert(n.is_type());
 
     //  Get the reflection state ready to pass to the function
-    auto cs = meta::compiler_services{ &errors, generated_tokens };
+    auto cs = meta::compiler_services{ &errors, &includes, generated_tokens };
     auto rtype = meta::type_declaration{ &n, cs };
 
     return apply_metafunctions(
@@ -88,7 +88,7 @@ struct declaration_sym {
 };
 
 struct identifier_sym {
-    enum kind { use, using_declaration, deactivation } kind_ = use;
+    enum kind: u8 { use, using_declaration, deactivation } kind_ = use;
     bool standalone_assignment_to = false;
     bool is_captured = false;
     bool is_after_dot = false;
@@ -174,7 +174,7 @@ struct selection_sym {
 struct compound_sym {
     bool start = false;
     compound_statement_node const* compound = {};
-    enum kind { is_scope, is_true, is_false, is_loop } kind_ = is_scope;
+    enum kind : u8 { is_scope, is_true, is_false, is_loop } kind_ = is_scope;
 
     compound_sym(
         bool                           s,
@@ -201,7 +201,7 @@ struct compound_sym {
 };
 
 struct symbol {
-    enum active { declaration=0, identifier, selection, compound };
+    enum active : u8 { declaration=0, identifier, selection, compound };
     std::variant <
         declaration_sym,
         identifier_sym,
@@ -253,7 +253,7 @@ struct symbol {
         }
 
         break;default:
-            assert (!"illegal symbol state");
+            assert (false && "ICE: illegal symbol state");
             return { 0, 0 };
         }
     }
@@ -284,7 +284,7 @@ struct symbol {
         }
 
         break;default:
-            assert (!"illegal symbol state");
+            assert (false && "ICE: illegal symbol state");
             return nullptr;
         }
     }
@@ -727,7 +727,7 @@ public:
         //-----------------------------------------------------------------------
         //  Function logic: For each entry in the table...
         //
-        for (auto sympos = unsafe_narrow<int>(std::ssize(symbols) - 1); sympos >= 0; --sympos)
+        for (auto sympos = unchecked_narrow<int>(std::ssize(symbols) - 1); sympos >= 0; --sympos)
         {
             //  If this is an uninitialized local variable,
             //  ensure it is definitely initialized and tag those initializations
@@ -1295,7 +1295,7 @@ private:
                             assert (std::ssize(selection_stack.back().branches) > 0);
                             selection_stack.back().branches.back().result = sym.standalone_assignment_to;
 
-                            int this_depth = symbols[pos].depth;
+                            const int this_depth = symbols[pos].depth;
                             while (symbols[pos + 1].depth >= this_depth) {
                                 ++pos;
                             }
@@ -1320,7 +1320,7 @@ private:
 
                         //  The depth of this branch should always be the depth of
                         //  the current selection statement + 1
-                        int branch_depth = symbols[selection_stack.back().pos].depth + 1;
+                        const int branch_depth = symbols[selection_stack.back().pos].depth + 1;
                         while (symbols[pos + 1].depth > branch_depth) {
                             ++pos;
                         }
@@ -1443,7 +1443,7 @@ private:
             }
 
             break;default:
-                assert (!"illegal symbol");
+                assert (false && "ICE: illegal symbol");
             }
 
         }
@@ -2130,8 +2130,8 @@ public:
     bool                              started_prefix_operators                 = false;
     bool                              is_out_expression                        = false;
     bool                              inside_next_expression                   = false;
-    bool                              inside_parameter_list                    = false;
-    bool                              inside_parameter_identifier              = false;
+    std::vector<bool>                 inside_parameter_list                    = {};
+    std::vector<bool>                 inside_parameter_identifier              = {};
     bool                              inside_returns_list                      = false;
     bool                              just_entered_for                         = false;
     token const*                      prev_token                               = nullptr;
@@ -2152,8 +2152,8 @@ public:
     auto push(std::vector<std::pair<int, int>>& uses) -> void
     {
         uses.emplace_back(
-            unsafe_narrow<int>(std::ssize(indices_of_uses_per_scope) - 1),
-            unsafe_narrow<int>(std::ssize(indices_of_uses_per_scope.back()))
+            unchecked_narrow<int>(std::ssize(indices_of_uses_per_scope) - 1),
+            unchecked_narrow<int>(std::ssize(indices_of_uses_per_scope.back()))
         );
     }
 
@@ -2206,7 +2206,7 @@ public:
         assert(sym.is_use());
         assert(sym.identifier);
 
-        indices_of_uses_per_scope.back().push_back(cpp2::unsafe_narrow<int>(std::ssize(symbols)));
+        indices_of_uses_per_scope.back().push_back(cpp2::unchecked_narrow<int>(std::ssize(symbols)));
         symbols.emplace_back(scope_depth, sym);
     }
 
@@ -2220,7 +2220,7 @@ public:
             && *decl.identifier != "_"
             )
         {
-            indices_of_activations_per_scope.back().push_back(cpp2::unsafe_narrow<int>(std::ssize(symbols)));
+            indices_of_activations_per_scope.back().push_back(cpp2::unchecked_narrow<int>(std::ssize(symbols)));
         }
         symbols.emplace_back(scope_depth, decl);
     }
@@ -2231,7 +2231,7 @@ public:
         assert(sym.is_using_declaration());
         assert(sym.identifier);
 
-        indices_of_activations_per_scope.back().push_back(cpp2::unsafe_narrow<int>(std::ssize(symbols)));
+        indices_of_activations_per_scope.back().push_back(cpp2::unchecked_narrow<int>(std::ssize(symbols)));
         symbols.emplace_back(scope_depth, sym);
     }
 
@@ -2289,31 +2289,41 @@ public:
 
     auto start(parameter_declaration_list_node const& n, int) -> void
     {
-        inside_parameter_list = true;
-        if (!n.in_function_typeid) {
+        inside_parameter_list.push_back( true );
+        if (
+            !n.in_function_typeid 
+            && !n.in_template_param_list
+            ) 
+        {
             push_lifetime_scope();
         }
     }
 
     auto end(parameter_declaration_list_node const&, int) -> void
     {
-        inside_parameter_list = false;
+        assert (!inside_parameter_list.empty());
+        inside_parameter_list.pop_back();
     }
 
     auto start(declaration_identifier_tag const&, int) -> void
     {
-        inside_parameter_identifier = inside_parameter_list;
+        inside_parameter_identifier.push_back( !inside_parameter_list.empty() );
     }
 
     auto end(declaration_identifier_tag const&, int) -> void
     {
-        inside_parameter_identifier = false;
+        assert (!inside_parameter_identifier.empty());
+        inside_parameter_identifier.pop_back();
     }
 
     auto start(parameter_declaration_node const& n, int) -> void
     {
-        //  Ignore parameters in function type-ids
-        if (n.is_in_function_typeid()) {
+        //  Ignore parameters in function type-ids and local templates
+        if (
+            n.is_in_function_typeid()
+            || n.is_in_template_param_list()
+            )
+        {
             return;
         }
 
@@ -2398,6 +2408,7 @@ public:
         }
 
         if (
+            //  Skip aliases
             !n.is_alias()
             //  Skip type scope (member) variables
             && !(n.parent_is_type() && n.is_object())
@@ -2408,9 +2419,11 @@ public:
                 )
             //  Skip non-out parameters
             && (
-                !inside_parameter_list
+                inside_parameter_list.empty()
                 || inside_out_parameter
                 )
+            //  Skip local variables that are pointers/etc. to functions
+            //&& !n.is_object_with_function_typeid()
             )
         {
             push_activation( declaration_sym( true, &n, n.name(), n.initializer.get(), inside_out_parameter, false, inside_returns_list ) );
@@ -2442,7 +2455,7 @@ public:
                 )
             //  Skip non-out parameters
             && (
-                !inside_parameter_list
+                inside_parameter_list.empty()
                 || inside_out_parameter
                 )
             //  Skip local variables that are pointers/etc. to functions
@@ -2665,7 +2678,7 @@ public:
             )
         {
             started_postfix_expression = false;
-            if (!inside_parameter_identifier)
+            if (inside_parameter_identifier.empty())
             {
                 //  Put this into the table if it's a use of an object in scope
                 //  or it's a 'copy' parameter (but to be a use it must be after
@@ -2713,7 +2726,7 @@ public:
     auto start(using_statement_node const& n, int) -> void
     {
         if (auto id = get_if<id_expression_node::qualified>(&n.id->id);
-            !n.for_namespace
+            !n.for_namespace()
             && id
             )
         {

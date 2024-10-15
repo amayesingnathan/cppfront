@@ -70,12 +70,15 @@ CPP2_REQUIRES_ (cpp2::impl::cmp_greater_eq(sizeof...(Args),0u)) ;
 
 #line 100 "pure2-print.cpp2"
     public: template<typename ...Args> [[nodiscard]] static auto all(Args const& ...args) -> bool;
+
+#line 103 "pure2-print.cpp2"
+    public: static auto y([[maybe_unused]] cpp2::impl::in<CPP2_TYPEOF(0)> unnamed_param_1) -> void;
     public: outer() = default;
     public: outer(outer const&) = delete; /* No 'that' constructor, suppress copy */
     public: auto operator=(outer const&) -> void = delete;
 
 
-#line 103 "pure2-print.cpp2"
+#line 105 "pure2-print.cpp2"
 };
 
 auto main() -> int;
@@ -123,9 +126,9 @@ requires (true) inline CPP2_CONSTEXPR T outer::object_alias{ 42 };
             if (cpp2::cpp2_default.is_active() && !(CPP2_UFCS(empty)(m) == false || false) ) { cpp2::cpp2_default.report_violation(CPP2_CONTRACT_MSG("message")); }
             if (testing_enabled && cpp2::bounds_safety.is_active() && !([_0 = 0, _1 = CPP2_UFCS(ssize)(m), _2 = 100]{ return cpp2::impl::cmp_less(_0,_1) && cpp2::impl::cmp_less(_1,_2); }() && true != false) ) { cpp2::bounds_safety.report_violation(CPP2_CONTRACT_MSG("size is " + cpp2::to_string(CPP2_UFCS(ssize)(m)) + "")); }
 #line 37 "pure2-print.cpp2"
-            auto a {[]() mutable -> void{}}; 
-            auto b {[]() mutable -> void{}}; 
-            auto c {[]() mutable -> void{}}; 
+            auto a {[]() -> void{}}; 
+            auto b {[]() -> void{}}; 
+            auto c {[]() -> void{}}; 
 
             for( ; CPP2_UFCS(empty)(s); a() ) {break; }
 
@@ -199,7 +202,10 @@ requires (cpp2::impl::cmp_greater_eq(sizeof...(Args),0u)) {
     template<typename ...Args> [[nodiscard]] auto outer::all(Args const& ...args) -> bool { 
         return (... && args);  }
 
-#line 105 "pure2-print.cpp2"
+#line 103 "pure2-print.cpp2"
+    auto outer::y([[maybe_unused]] cpp2::impl::in<CPP2_TYPEOF(0)> unnamed_param_1) -> void{}
+
+#line 107 "pure2-print.cpp2"
 auto main() -> int{
     outer::test();
 }

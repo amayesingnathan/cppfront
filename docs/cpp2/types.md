@@ -180,7 +180,7 @@ All other `#!cpp operator=` functions are explicitly written, either by hand or 
 
 ### <a id="memberwise-default"></a> Memberwise by default
 
-All copy/move/comparison `#!cpp operator=` functions are memberwise by default in Cpp2. That includes when you write memberwise construction and assignment yourself.
+All copy/move/conversion `#!cpp operator=` functions are memberwise by default in Cpp2. That includes when you write memberwise construction and assignment yourself.
 
 In a hand-written `#!cpp operator=`:
 
@@ -281,6 +281,8 @@ The above is the same as in Cpp1 because most of Cpp2's `#!cpp operator<=>` feat
 if lo <= requested < hi {
     // ... do something ...
 }
+
+//  Equivalent result to: (lo ..< hi).contains( requested )
 ```
 
 For more details, see [P0515R0 "Consistent comparison" section 3.3](https://wg21.link/p0515r0) and [P0893 "Chaining comparisons"](https://wg21.link/p0893).

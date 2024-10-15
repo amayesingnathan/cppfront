@@ -15,10 +15,10 @@ class vals;
 //=== Cpp2 type definitions and function declarations ===========================
 
 #line 1 "pure2-trailing-commas.cpp2"
-[[nodiscard]] auto f(auto const& a, auto const& b) -> auto;
+[[nodiscard]] auto f(auto const& a, auto const& b) -> decltype(auto);
 
 #line 3 "pure2-trailing-commas.cpp2"
-template<typename T, typename U> [[nodiscard]] auto g(T const& a, U const& b) -> auto;
+template<typename T, typename U> [[nodiscard]] auto g(T const& a, U const& b) -> decltype(auto);
 using doubler_ret = int;
 
 
@@ -27,9 +27,11 @@ using doubler_ret = int;
 
 #line 9 "pure2-trailing-commas.cpp2"
 class vals {public: int i; 
-public: vals(auto const& i_);
+public: vals(auto&& i_)
+CPP2_REQUIRES_ (std::is_convertible_v<CPP2_TYPEOF(i_), std::add_const_t<int>&>) ;
 
-public: auto operator=(auto const& i_) -> vals& ;
+public: auto operator=(auto&& i_) -> vals& 
+CPP2_REQUIRES_ (std::is_convertible_v<CPP2_TYPEOF(i_), std::add_const_t<int>&>) ;
 
 #line 9 "pure2-trailing-commas.cpp2"
 };
@@ -39,10 +41,10 @@ auto main() -> int;
 //=== Cpp2 function definitions =================================================
 
 #line 1 "pure2-trailing-commas.cpp2"
-[[nodiscard]] auto f(auto const& a, auto const& b) -> auto { return a + b;  }
+[[nodiscard]] auto f(auto const& a, auto const& b) -> decltype(auto) { return a + b;  }
 
 #line 3 "pure2-trailing-commas.cpp2"
-template<typename T, typename U> [[nodiscard]] auto g(T const& a, U const& b) -> auto { return a + b;  }
+template<typename T, typename U> [[nodiscard]] auto g(T const& a, U const& b) -> decltype(auto) { return a + b;  }
 
 #line 5 "pure2-trailing-commas.cpp2"
 [[nodiscard]] auto doubler(cpp2::impl::in<int> a) -> doubler_ret{
@@ -51,12 +53,14 @@ template<typename T, typename U> [[nodiscard]] auto g(T const& a, U const& b) ->
     i.construct(a * 2);
 return std::move(i.value()); }
 
-vals::vals(auto const& i_)
-                                             : i{ i_ }{}
+vals::vals(auto&& i_)
+requires (std::is_convertible_v<CPP2_TYPEOF(i_), std::add_const_t<int>&>) 
+                                                           : i{ CPP2_FORWARD(i_) }{}
 
-auto vals::operator=(auto const& i_) -> vals& {
-                                             i = i_;
-                                             return *this;}
+auto vals::operator=(auto&& i_) -> vals& 
+requires (std::is_convertible_v<CPP2_TYPEOF(i_), std::add_const_t<int>&>) {
+                                                           i = CPP2_FORWARD(i_);
+                                                           return *this;}
 #line 11 "pure2-trailing-commas.cpp2"
 auto main() -> int{
 {

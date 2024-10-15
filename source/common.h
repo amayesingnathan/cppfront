@@ -20,6 +20,15 @@
     #pragma GCC diagnostic ignored "-Wdangling-reference"
 #endif
 
+//  Disable some clang conversion warnings:
+//      cppfront uses signed integer types for indices and container sizes.
+//  Note: We don't pop the diagnostic because we want them disabled in the
+//  entire cppfront translation unit.
+#ifdef __clang__
+    #pragma clang diagnostic push
+    #pragma clang diagnostic ignored "-Wsign-conversion"
+#endif
+
 #include "cpp2util.h"
 
 
@@ -38,20 +47,11 @@
 #ifndef CPP2_COMMON_H
 #define CPP2_COMMON_H
 
-#include <algorithm>
 #include <cassert>
 #include <cctype>
 #include <chrono>
-#include <compare>
-#include <cstdint>
 #include <iomanip>
-#include <iterator>
-#include <memory>
-#include <map>
-#include <string>
-#include <string_view>
 #include <unordered_map>
-#include <vector>
 
 namespace cpp2 {
 
@@ -65,7 +65,7 @@ struct source_line
 {
     std::string text;
 
-    enum class category { empty, preprocessor, comment, import, cpp1, cpp2, rawstring };
+    enum class category : u8 { empty, preprocessor, comment, import, cpp1, cpp2, rawstring };
     category cat;
 
     bool all_tokens_are_densely_spaced = true; // to be overridden in lexing if they're not
@@ -82,7 +82,7 @@ struct source_line
         -> int
     {
         return
-            unsafe_narrow<int>(std::find_if_not( text.begin(), text.end(), &isspace )
+            unchecked_narrow<int>(std::find_if_not( text.begin(), text.end(), &isspace )
                                - text.begin());
     }
 
@@ -97,7 +97,7 @@ struct source_line
         break;case category::cpp1:          return "/* 1 */ ";
         break;case category::cpp2:          return "/* 2 */ ";
         break;case category::rawstring:     return "/* R */ ";
-        break;default: assert(!"illegal category"); abort();
+        break;default: assert(false && "ICE: illegal category"); abort();
         }
     }
 };
@@ -128,7 +128,7 @@ struct source_position
 
 struct comment
 {
-    enum class comment_kind { line_comment = 0, stream_comment };
+    enum class comment_kind : u8 { line_comment = 0, stream_comment };
 
     comment_kind    kind;
     source_position start;
@@ -141,7 +141,7 @@ struct comment
 struct string_parts {
     struct cpp_code   { std::string text; };
     struct raw_string { std::string text; };
-    enum adds_sequences { no_ends = 0, on_the_beginning = 1, on_the_end = 2, on_both_ends = 3 };
+    enum adds_sequences : u8 { no_ends = 0, on_the_beginning = 1, on_the_end = 2, on_both_ends = 3 };
 
     string_parts(const std::string& beginseq,
                  const std::string& endseq,
@@ -648,6 +648,22 @@ class cmdline_processor
         flag(int g, std::string_view n, std::string_view d, callback0 h0, callback1 h1, std::string_view s, bool o)
             : group{g}, name{n}, description{d}, handler0{h0}, handler1{h1}, synonym{s}, opt_out{o}
         { }
+
+        auto get_name(bool indicate_short_name = false) const {
+            auto n = name.substr(0, unique_prefix);
+            if (unique_prefix < std::ssize(name)) {
+                auto name_length = _as<int>(std::min(name.find(' '), name.size()));
+                if (indicate_short_name) {
+                    n += "[";
+                }
+                n += name.substr(unique_prefix, name_length - unique_prefix);
+                if (indicate_short_name) {
+                    n += "]";
+                }
+                n += name.substr(name_length);
+            }
+            return n;
+        }
     };
     std::vector<flag> flags;
     int max_flag_length = 0;
@@ -669,13 +685,16 @@ class cmdline_processor
     }
 
 public:
-    auto flags_starting_with(std::string_view s)
+    auto flags_starting_with(
+        std::string_view s, 
+        bool             indicate_short_name = true
+    )
         -> std::vector<std::string>
     {
         auto ret = std::vector<std::string>{};
-        for (auto const& f : flags) {
-            if (f.name.starts_with(s)) {
-                ret.push_back(f.name);
+        for (auto const& flag : flags) {
+            if (flag.name.starts_with(s)) {
+                ret.push_back( flag.get_name(indicate_short_name) );
             }
         }
         return ret;
@@ -801,14 +820,7 @@ public:
                 }
             }
             print("  -");
-            auto n = flag.name.substr(0, flag.unique_prefix);
-            if (flag.unique_prefix < std::ssize(flag.name)) {
-                auto name_length = _as<int>(std::min(flag.name.find(' '), flag.name.size()));
-                n += "[";
-                n += flag.name.substr(flag.unique_prefix, name_length - flag.unique_prefix);
-                n += "]";
-                n += flag.name.substr(name_length);
-            }
+            auto n = flag.get_name(true);
             if (flag.opt_out) {
                 n += "[-]";
             }
@@ -836,7 +848,7 @@ public:
         auto length = std::ssize(name);
         if (opt_out) { length += 3; }   // space to print "[-]"
         if (max_flag_length < length) {
-            max_flag_length = unsafe_narrow<int>(length);
+            max_flag_length = unchecked_narrow<int>(length);
         }
     }
     struct register_flag {
@@ -880,8 +892,8 @@ public:
         -> void
     {
         help_requested = true;
-        std::string_view a = __DATE__;
-        std::string_view b = __TIME__;
+        constexpr std::string_view a = __DATE__;
+        constexpr std::string_view b = __TIME__;
         std::unordered_map<std::string_view, char> m = { {"Jan",'1'}, {"Feb",'2'}, {"Mar",'3'}, {"Apr",'4'}, {"May",'5'}, {"Jun",'6'}, {"Jul",'7'}, {"Aug",'8'}, {"Sep",'9'}, {"Oct",'A'}, {"Nov",'B'}, {"Dec",'C'} };
 
         auto stamp = std::to_string(atoi(&a[9])-15);
@@ -1072,7 +1084,7 @@ public:
     }
 
     auto ssize() const -> ptrdiff_t {
-        return unsafe_narrow<ptrdiff_t>(size());
+        return unchecked_narrow<ptrdiff_t>(size());
     }
 
     auto operator[](size_t idx) -> T& {

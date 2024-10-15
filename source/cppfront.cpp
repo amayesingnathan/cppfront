@@ -72,8 +72,8 @@ auto main(
             }
             else {
                 std::cerr << arg.text << " - ambiguous compiler flag name, did you mean one of these?\n";
-                for (auto a : ambiguous) {
-                    std::cerr << "    " << arg.text.front() << a << "\n";
+                for (auto const& a : ambiguous) {
+                    std::cerr << "  " << arg.text.front() << a << "\n";
                 }
             }
             return EXIT_FAILURE;
@@ -113,10 +113,10 @@ auto main(
                     auto total = count.cpp1_lines + count.cpp2_lines;
                     auto total_lines = print_with_thousands(total);
                     out << "   Cpp1  "
-                        << std::right << std::setw(total_lines.size())
+                        << std::right << std::setw(unchecked_narrow<int>(total_lines.size()))
                         << print_with_thousands(count.cpp1_lines) << " line" << (count.cpp1_lines != 1 ? "s" : "");
                     out << "\n   Cpp2  "
-                        << std::right << std::setw(total_lines.size())
+                        << std::right << std::setw(unchecked_narrow<int>(total_lines.size()))
                         << print_with_thousands(count.cpp2_lines) << " line" << (count.cpp2_lines != 1 ? "s" : "");
                     if (total > 0) {
                         out << " (";
@@ -137,7 +137,7 @@ auto main(
                     auto total_time = print_with_thousands(t.elapsed().count());
                     std::cout << "\n   Time  " << total_time << " ms";
 
-                    std::multimap< long long, std::string_view, std::greater<long long> > sorted_timers;
+                    std::multimap< long long, std::string_view, std::greater<> > sorted_timers;
                     for (auto [name, t] : timers) {
                         sorted_timers.insert({t.elapsed().count(), name});
                     }
@@ -145,7 +145,7 @@ auto main(
                     for (auto [elapsed, name] : sorted_timers) {
                         std::cout
                             << "\n         "
-                            << std::right << std::setw(total_time.size())
+                            << std::right << std::setw(unchecked_narrow<int>(total_time.size()))
                             << print_with_thousands(elapsed) << " ms" << " in " << name;
                     }
                 }

@@ -243,7 +243,7 @@ private:
 
 public:
     //  Modal information
-    enum phases {
+    enum phases : u8 {
         phase0_type_decls           = 0,
         phase1_type_defs_func_decls = 1,
         phase2_func_defs            = 2
@@ -257,7 +257,7 @@ private:
         switch (phase) {
         break;case phase0_type_decls          : phase = phase1_type_defs_func_decls;
         break;case phase1_type_defs_func_decls: phase = phase2_func_defs;
-        break;default                         : assert(!"ICE: invalid lowering phase");
+        break;default                         : assert(false && "ICE: invalid lowering phase");
         }
         curr_pos     = {};
         next_comment = 0;   // start over with the comments
@@ -266,7 +266,7 @@ private:
     std::vector<std::string*>                emit_string_targets;       // option to emit to string instead of out file
     std::vector<std::vector<text_with_pos>*> emit_text_chunks_targets;  // similar for vector<text_pos>
 
-    enum class target_type { string, chunks };
+    enum class target_type : u8 { string, chunks };
     std::vector<target_type>                 emit_target_stack;         // to interleave them sensibly
 
 
@@ -365,11 +365,11 @@ private:
             //  Now also adjust the colno
             if (last_newline != s.npos) {
                 //  If we found a newline, it's the distance from the last newline to EOL
-                curr_pos.colno = unsafe_narrow<colno_t>(s.length() - last_newline);
+                curr_pos.colno = unchecked_narrow<colno_t>(s.length() - last_newline);
             }
             else {
                 //  Else add the length of the string
-                curr_pos.colno += unsafe_narrow<colno_t>(s.length());
+                curr_pos.colno += unchecked_narrow<colno_t>(s.length());
             }
         }
     }
@@ -423,7 +423,7 @@ private:
         if (c.kind == comment::comment_kind::line_comment) {
             print( pad( c.start.colno - curr_pos.colno + 1 ) );
             print( c.text );
-            assert( c.text.find("\n") == c.text.npos ); // we shouldn't have newlines
+            assert( c.text.find('\n') == c.text.npos ); // we shouldn't have newlines
             print("\n");
         }
 
@@ -616,8 +616,8 @@ public:
     //  Open
     //
     auto open(
-        std::string                 cpp2_filename_,
-        std::string                 cpp1_filename_,
+        std::string const&          cpp2_filename_,
+        std::string const&          cpp1_filename_,
         std::vector<comment> const& comments,
         cpp2::source const&         source,
         cpp2::parser const&         parser
@@ -1014,6 +1014,7 @@ class cppfront
 {
     std::string              sourcefile;
     std::vector<error_entry> errors;
+    std::set<std::string>    includes;
 
     //  For building
     //
@@ -1023,7 +1024,6 @@ class cppfront
     cpp2::sema   sema;
 
     bool source_loaded                  = true;
-    bool last_postfix_expr_was_pointer  = false;
     bool violates_bounds_safety         = false;
     bool violates_initialization_safety = false;
     bool suppress_move_from_last_use    = false;
@@ -1056,6 +1056,15 @@ class cppfront
     using source_order_name_lookup_res =
         std::optional<std::variant<declaration_node const*, active_using_declaration>>;
 
+    struct postfix_expression_info {
+        bool is_pointer  = false;
+
+        postfix_expression_info() = default;
+        postfix_expression_info(bool b) : is_pointer{b} { }
+    };
+    std::vector<postfix_expression_info> active_postfix_expressions = {};
+    bool last_postfix_expr_was_pointer = false;
+
     //  Stack of the currently active nested declarations we're inside
     std::vector<declaration_node const*> current_declarations = { {} };
 
@@ -1083,7 +1092,7 @@ class cppfront
         )
             : decl{decl_}
             , func{func_}
-            , declared_value_set_functions{declared_value_set_functions_}
+            , declared_value_set_functions{std::move(declared_value_set_functions_)}
         { }
     };
     class current_functions_
@@ -1091,9 +1100,9 @@ class cppfront
         stable_vector<function_info> list = { {} };
     public:
         auto push(
-            declaration_node const*                    decl,
-            function_type_node const*                  func,
-            declaration_node::declared_value_set_funcs thats
+            declaration_node const*                           decl,
+            function_type_node const*                         func,
+            declaration_node::declared_value_set_funcs const& thats
         ) {
             list.emplace_back(decl, func, thats);
         }
@@ -1166,7 +1175,7 @@ public:
         : sourcefile{ filename }
         , source    { errors }
         , tokens    { errors }
-        , parser    { errors }
+        , parser    { errors, includes }
         , sema      { errors }
     {
         //  "Constraints enable creativity in the right directions"
@@ -1322,6 +1331,10 @@ public:
 
             if (flag_no_rtti) {
                 printer.print_extra( "#define CPP2_NO_RTTI             Yes\n" );
+            }
+
+            for (auto& h: includes) {
+                printer.print_extra( "#include \"" + h + "\"\n" );
             }
         }
 
@@ -1644,8 +1657,15 @@ public:
                 || n == "finally"
                 || n == "cpp1_ref"
                 || n == "cpp1_rvalue_ref"
-                || n == "unsafe_narrow"
-                || n == "unsafe_cast"
+                || n == "unchecked_narrow"
+                || n == "unchecked_cast"
+                || n == "unchecked_cmp_less"
+                || n == "unchecked_cmp_less_eq"
+                || n == "unchecked_cmp_greater"
+                || n == "unchecked_cmp_greater_eq"
+                || n == "unchecked_div"
+                || n == "unchecked_dereference"
+                || n == "unchecked_subscript"
                 )
             )
         {
@@ -1679,7 +1699,11 @@ public:
         {
             printer.print_cpp2("cpp2_"+n.to_string(), pos);
         }
-        else if (n == "type_of") {
+        else if (
+            !is_qualified
+            && n == "type_of"
+            )
+        {
             printer.print_cpp2("CPP2_TYPEOF", pos);
         }
         else {
@@ -1734,7 +1758,7 @@ public:
 
         //  We always want to std::move from named return values,
         //  regardless of their types, so use std::move for that
-        bool add_std_move =
+        const bool add_std_move =
             synthesized_multi_return_size > 1
             || (
                 synthesized_multi_return_size == 1
@@ -1758,7 +1782,7 @@ public:
 
         //  Add `cpp2::move(*this).` when implicitly moving a member on last use
         //  This way, members of lvalue reference type won't be implicitly moved
-        bool add_this =
+        const bool add_this =
             add_move
             && decl
             && decl->identifier
@@ -1934,6 +1958,7 @@ public:
             printer.print_cpp2("auto", pos);
         }
         else {
+            try_emit<type_id_node::postfix    >(n.id);
             try_emit<type_id_node::unqualified>(n.id, 0, false);
             try_emit<type_id_node::qualified  >(n.id);
             try_emit<type_id_node::keyword    >(n.id);
@@ -2349,7 +2374,7 @@ public:
         }
 
         else {
-            assert(!"ICE: unexpected case");
+            assert(false && "ICE: unexpected case");
         }
 
         assert (iteration_statements.back().stmt);
@@ -2367,6 +2392,80 @@ public:
 
         iteration_statements.pop_back();
     }
+
+
+    //-----------------------------------------------------------------------
+    //
+    auto check_return_expression_lifetime(expression_node const& n)
+        -> bool
+    {
+        assert(!current_functions.empty());
+        auto is_forward_return =
+            !function_returns.empty()
+            && (
+                function_returns.back().pass == passing_style::forward
+                || function_returns.back().pass == passing_style::forward_ref
+                )
+            ;
+
+        //  If we're doing a forward return of a single-token name
+        //  (the entire expression is a postfix-expression)
+        auto solo_postfix = n.expr->get_if_only_a_postfix_expression_node();
+        auto tok          = solo_postfix ? solo_postfix->expr->get_token() : nullptr;
+        if (
+            tok
+            && is_forward_return
+            )
+        {
+            //  Ensure we're not returning a local or an in/move parameter
+            auto is_parameter_name = current_functions.back().decl->has_parameter_named(*tok);
+            if (
+                is_parameter_name
+                && (
+                    current_functions.back().decl->has_in_parameter_named(*tok)
+                    || current_functions.back().decl->has_copy_parameter_named(*tok)
+                    || current_functions.back().decl->has_move_parameter_named(*tok)
+                    )
+                )
+            {
+                errors.emplace_back(
+                    n.position(),
+                    "a 'forward' return type cannot return an 'in', 'copy', or 'move' parameter"
+                );
+                return false;
+            }
+            else if (
+                !is_parameter_name
+                && sema.get_declaration_of(*tok)
+                && !sema.is_captured(*tok)
+                )
+            {
+                errors.emplace_back(
+                    n.position(),
+                    "a 'forward' return type cannot return a local variable"
+                );
+                return false;
+            }
+            
+            //  Deduced forward returns are okay because decltype(auto) can deduce a value
+            else if (
+                !function_returns.back().is_deduced
+                && (
+                    is_literal(tok->type()) 
+                    || n.expr->is_result_a_temporary_variable()
+                    )
+            )
+            {
+                errors.emplace_back(
+                    n.position(),
+                    "a 'forward specific_type' return type must return an 'inout', 'out', or 'forward' parameter; it cannot return a complex expression -- for example: for a function that takes a stream object 'output`, instead of 'return output << data;' write 'output << data; return output;'"
+                );
+                return false;
+            }
+        }
+
+        return true;
+    };
 
 
     //-----------------------------------------------------------------------
@@ -2393,59 +2492,14 @@ public:
         //
         if (n.expression)
         {
-            assert(!current_functions.empty());
-            auto is_forward_return =
-                !function_returns.empty()
-                && function_returns.back().pass == passing_style::forward;
+            if (!check_return_expression_lifetime(*n.expression)) {
+                return;
+            }
+
             auto is_deduced_return =
                 !function_returns.empty()
-                && function_returns.back().is_deduced;
-
-            //  If we're doing a forward return of a single-token name
-            if (auto tok = n.expression->expr->get_postfix_expression_node()->expr->get_token();
-                tok
-                && is_forward_return
-                )
-            {
-                //  Ensure we're not returning a local or an in/move parameter
-                auto is_parameter_name = current_functions.back().decl->has_parameter_named(*tok);
-                if (
-                    is_parameter_name
-                    && (
-                        current_functions.back().decl->has_in_parameter_named(*tok)
-                        || current_functions.back().decl->has_copy_parameter_named(*tok)
-                        || current_functions.back().decl->has_move_parameter_named(*tok)
-                        )
-                    )
-                {
-                    errors.emplace_back(
-                        n.position(),
-                        "a 'forward' return type cannot return an 'in', 'copy', or 'move' parameter"
-                    );
-                    return;
-                }
-                else if (
-                    !is_parameter_name
-                    && sema.get_declaration_of(*tok)
-                    && !sema.is_captured(*tok)
-                    )
-                {
-                    errors.emplace_back(
-                        n.position(),
-                        "a 'forward' return type cannot return a local variable"
-                    );
-                    return;
-                } else if (
-                    is_literal(tok->type()) || n.expression->expr->is_result_a_temporary_variable()
-                )
-                {
-                    errors.emplace_back(
-                        n.position(),
-                        "a 'forward' return type must return an 'inout', 'out', or 'forward' parameter; it cannot return a complex expression -- for example: for a function that takes a stream object 'output`, instead of 'return output << data;' write 'output << data; return output;'"
-                    );
-                    return;
-                }
-            }
+                && function_returns.back().is_deduced
+                ;
 
             //  If this expression is just a single expression-list, we can
             //  take over direct control of emitting it without needing to
@@ -2521,7 +2575,7 @@ public:
                 assert(param->declaration->identifier);
 
                 printer.emit_to_string(&stmt);
-                emit(*param->declaration->identifier, cpp2::unsafe_narrow<int>(parameters.size()));
+                emit(*param->declaration->identifier, cpp2::unchecked_narrow<int>(parameters.size()));
                 printer.emit_to_string();
             }
 
@@ -2586,13 +2640,19 @@ public:
         assert(n.keyword);
         emit(*n.keyword);
 
-        if (n.for_namespace) {
+        if (n.for_namespace()) {
             printer.print_cpp2(" namespace", n.position());
         } else {
             current_names.push_back(active_using_declaration{n});
         }
 
-        printer.print_cpp2(" " + print_to_string(*n.id) + ";", n.position());
+        auto id = print_to_string(*n.id);
+        if (n.for_namespace()) {
+            assert(id.ends_with("::_"));
+            id.resize( id.size() - 3 );     // maybe someday: id.remove_suffix(3)
+        }
+
+        printer.print_cpp2(" " + id + ";", n.position());
     }
 
 
@@ -2825,7 +2885,7 @@ public:
             return is_pointer_declaration(type_id_node->suspicious_initialization, deref_cnt, addr_cnt);
         }
 
-        return (unsafe_narrow<int>(pointer_declarators_cnt) + addr_cnt - deref_cnt) > 0;
+        return (unchecked_narrow<int>(pointer_declarators_cnt) + addr_cnt - deref_cnt) > 0;
     }
 
     auto is_pointer_declaration(
@@ -3020,7 +3080,11 @@ public:
         }
 
         assert(n.expr);
-        last_postfix_expr_was_pointer = false;
+        active_postfix_expressions.emplace_back(false);
+        auto guard = finally([this]{ 
+            last_postfix_expr_was_pointer = active_postfix_expressions.back().is_pointer;
+            active_postfix_expressions.pop_back();
+            });
 
         //  For a 'move that' parameter, track the members we already moved from
         //  so we can diagnose attempts to move from the same member twice
@@ -3101,7 +3165,7 @@ public:
                 //        - we don't deduce pointer types from parameter_declaration_list_node
                 if ( is_pointer_declaration(unqual->identifier) ) {
                     if (n.ops.empty()) {
-                        last_postfix_expr_was_pointer = true;
+                        active_postfix_expressions.back().is_pointer = true;
                     }
                     else
                     {
@@ -3291,14 +3355,18 @@ public:
                     ufcs_string += "_TEMPLATE";
                 }
 
-                //  If we're in an object declaration (i.e., initializer)
-                //  at namespace scope, use the _NONLOCAL version
+                //  If we're in a namespace-scope object declaration (i.e., initializer)
+                //  or in a default function argument, use the _NONLOCAL version
                 //
                 //  Note: If there are other cases where code could execute
                 //  in a non-local scope where a capture-default for the UFCS
                 //  lambda would not be allowed, then add them here
                 if (
                     current_declarations.back()->is_namespace()
+                    || (
+                        current_declarations.back()->is_parameter()
+                        && !current_declarations.back()->is_statement_parameter()
+                        )
                     || (
                         current_declarations.back()->is_object()
                         && current_declarations.back()->parent_is_namespace()
@@ -3636,10 +3704,17 @@ public:
                 }
                 else {
                     auto op_name = i->op->to_string();
+                    auto type_name = print_to_string(*i->type);
                     if (op_name == "as") {
+                        if (type_name == "void") {
+                            errors.emplace_back(
+                                n.position(),
+                                "'expression as void' is not allowed - use '_ = expression' instead to discard the result"
+                            );
+                        }
                         op_name = "as_";    // use the static_assert-checked 'as' by default...
                     }                       // we'll override this inside inspect-expressions
-                    prefix += "cpp2::impl::" + op_name + "<" + print_to_string(*i->type) + ">(";
+                    prefix += "cpp2::impl::" + op_name + "<" + type_name + ">(";
                     suffix = ")" + suffix;
                 }
             }
@@ -4049,11 +4124,6 @@ public:
     )
         -> void
     {   STACKINSTR
-        if (n.default_initializer) {
-          printer.print_cpp2("{}", n.position());
-          return;
-        }
-
         auto add_parens =
             should_add_expression_list_parens()
             && !n.inside_initializer
@@ -4063,6 +4133,14 @@ public:
             n.is_fold_expression() &&
             !(n.inside_initializer && current_declarations.back()->initializer->position() != n.open_paren->position())
             ;
+
+        if (n.default_initializer) {
+            if (add_parens) {
+                printer.print_cpp2("{}", n.position());
+            }
+            return;
+        }
+
         if (add_parens) {
             printer.print_cpp2( *n.open_paren, n.position());
         }
@@ -4075,7 +4153,11 @@ public:
             first = false;
             auto is_out = false;
 
-            if (x.pass != passing_style::in) {
+            if (
+                x.pass != passing_style::in
+                && x.pass != passing_style::in_ref
+                ) 
+            {
                 assert(
                     x.pass == passing_style::out
                     || x.pass == passing_style::move
@@ -4136,11 +4218,17 @@ public:
         assert(n.expr);
         auto generating_return = false;
 
-        if (function_body_start != source_position{}) {
+        if (function_body_start != source_position{})
+        {
             emit_prolog_mem_inits(function_prolog, n.position().colno);
             printer.print_cpp2(" { ", function_body_start);
             emit_prolog_statements(function_prolog, n.position().colno);
-            if (!function_void_ret) {
+
+            if (!function_void_ret)
+            {
+                if (!check_return_expression_lifetime(*n.expr)) {
+                    return;
+                }
                 printer.print_cpp2("return ", n.position());
                 generating_return = true;
             }
@@ -4381,6 +4469,63 @@ public:
 
         current_names.push_back(&*n.declaration);
 
+
+        //  Common initialization
+        //
+        auto emit_initializer = [&]
+        {
+            assert(n.declaration);
+            auto is_param_to_namespace_scope_type =
+                n.declaration->parent_is_type() 
+                && n.declaration->parent_declaration->parent_is_namespace() 
+                ;
+
+            auto emit_in_phase_0 =
+                is_param_to_namespace_scope_type
+                && printer.get_phase() == printer.phase0_type_decls
+                ;
+
+            auto emit_in_phase_1 =
+                !is_param_to_namespace_scope_type
+                && printer.get_phase() == printer.phase1_type_defs_func_decls
+                ;
+
+            if (
+                !is_returns
+                && n.declaration->initializer
+                && (
+                    n.is_in_function_scope()    // implies we're in phase 1 or 2
+                    || emit_in_phase_0
+                    || emit_in_phase_1
+                    )
+                )
+            {
+                auto expr  = n.declaration->initializer->get_if<expression_statement_node>();
+                assert(expr->expr);
+                auto empty = expr && expr->is_empty_expression_list();
+
+                auto guard = stack_element(current_declarations, &*n.declaration);
+                if (is_statement) {
+                    printer.print_cpp2( "{", n.declaration->initializer->position() );
+                }
+                else {
+                    printer.print_cpp2( " = ", n.declaration->initializer->position() );
+                }
+
+                if (empty && !is_statement) {
+                    printer.print_cpp2( "{}", n.declaration->initializer->position() );
+                }
+                else {
+                    emit(*n.declaration->initializer, false);
+                }
+
+                if (is_statement) {
+                    printer.print_cpp2( "};", n.declaration->initializer->position() );
+                }
+            }
+        };
+
+
         //-----------------------------------------------------------------------
         //  Skip 'this' parameters
 
@@ -4436,7 +4581,7 @@ public:
         //-----------------------------------------------------------------------
         //  Handle type parameters
 
-        // Common template naming
+        //  Common template naming
         auto emit_template_name = [&]() {
             if (n.declaration->is_variadic) {
                 printer.print_cpp2(
@@ -4458,6 +4603,7 @@ public:
             printer.print_cpp2("typename ", identifier_pos);
 
             emit_template_name();
+            emit_initializer();
             return;
         }
 
@@ -4472,6 +4618,7 @@ public:
             printer.print_cpp2(" ", type_id.position());
 
             emit_template_name();
+            emit_initializer();
             return;
         }
 
@@ -4572,10 +4719,8 @@ public:
                 && !type_id.is_wildcard()
                 )
             {
-                auto name = n.declaration->identifier->get_token();
-                assert(name);
                 auto req = std::string{"(std::is_convertible_v<CPP2_TYPEOF("};
-                req += *name;
+                req += identifier;
                 req += "), ";
                 req += param_type;
                 req += "> && ...)";
@@ -4583,7 +4728,8 @@ public:
             }
 
             switch (n.pass) {
-            break;case passing_style::in     : printer.print_cpp2( name+" const&", n.position() );
+            break;case passing_style::in     : 
+                  case passing_style::in_ref : printer.print_cpp2( name+" const&", n.position() );
             break;case passing_style::copy   : printer.print_cpp2( name,           n.position() );
             break;case passing_style::inout  : printer.print_cpp2( name+"&",       n.position() );
 
@@ -4601,25 +4747,23 @@ public:
             }
 
             if (type_id.constraint) {
-                auto name = n.declaration->identifier->get_token();
-                assert(name);
                 auto req = print_to_string(*type_id.constraint);
-                req += "<CPP2_TYPEOF(";
-                req += *name;
-                req += ")>";
+                if (auto pos = req.find('<'); pos != req.npos) {
+                    req.insert(pos+1, "CPP2_TYPEOF(" + identifier + "), ");
+                } else {
+                    req.append("<CPP2_TYPEOF("+ identifier +")>");
+                }
                 function_requires_conditions.push_back(req);
             }
         }
         else if (n.pass == passing_style::forward) {
             printer.print_cpp2("auto", n.position());
 
-            auto name = n.declaration->identifier->get_token();
-            assert(name);
-            auto req = std::string{"std::is_same_v<"};
+            auto req = std::string{"std::is_convertible_v<CPP2_TYPEOF("};
+            req += identifier;
+            req += "), std::add_const_t<";
             req += param_type;
-            req += ", CPP2_TYPEOF(";
-            req += *name;
-            req += ")>";
+            req += ">&>";
             function_requires_conditions.push_back(req);
         }
         else {
@@ -4644,12 +4788,13 @@ public:
             )
         {
             switch (n.pass) {
-            break;case passing_style::in     : printer.print_cpp2( ">",  n.position() );
-            break;case passing_style::copy   : printer.print_cpp2( "",   n.position() );
-            break;case passing_style::inout  : printer.print_cpp2( "&",  n.position() );
-            break;case passing_style::out    : printer.print_cpp2( ">",  n.position() );
-            break;case passing_style::move   : printer.print_cpp2( "&&", n.position() );
-            break;case passing_style::forward: printer.print_cpp2( "&&", n.position() );
+            break;case passing_style::in     : printer.print_cpp2( ">",       n.position() );
+            break;case passing_style::in_ref : printer.print_cpp2( " const&", n.position() );
+            break;case passing_style::copy   : printer.print_cpp2( "",        n.position() );
+            break;case passing_style::inout  : printer.print_cpp2( "&",       n.position() );
+            break;case passing_style::out    : printer.print_cpp2( ">",       n.position() );
+            break;case passing_style::move   : printer.print_cpp2( "&&",      n.position() );
+            break;case passing_style::forward: printer.print_cpp2( "&&",      n.position() );
             break;default: ;
             }
         }
@@ -4677,23 +4822,7 @@ public:
             printer.print_cpp2( identifier, identifier_pos );
         }
 
-        if (
-            !is_returns
-            && n.declaration->initializer
-            )
-        {
-            auto guard = stack_element(current_declarations, &*n.declaration);
-            if (is_statement) {
-                printer.print_cpp2( "{", n.declaration->initializer->position() );
-            }
-            else {
-                printer.print_cpp2( " = ", n.declaration->initializer->position() );
-            }
-            emit(*n.declaration->initializer, !is_statement);
-            if (is_statement) {
-                printer.print_cpp2( "};", n.declaration->initializer->position() );
-            }
-        }
+        emit_initializer();
     }
 
 
@@ -4861,9 +4990,9 @@ public:
         function_type_node const& n,
         bool                      is_main                    = false,
         bool                      is_ctor_or_dtor            = false,
-        std::string               suffix1                    = {},
+        std::string const&        suffix1                    = {},
         bool                      generating_postfix_inc_dec = false,
-        std::string               identifier                 = {}
+        std::string const&        identifier                 = {}
     )
         -> void
     {   STACKINSTR
@@ -4897,9 +5026,18 @@ public:
 
             auto return_type = print_to_string(*r.type);
 
-            if (r.pass == passing_style::forward) {
+            if (
+                r.pass == passing_style::forward
+                || r.pass == passing_style::forward_ref
+                )
+            {
                 if (r.type->is_wildcard()) {
-                    printer.print_cpp2( "auto&&", n.position() );
+                    if (r.pass == passing_style::forward) {
+                        printer.print_cpp2( "decltype(auto)", n.position() );
+                    }
+                    else {
+                        printer.print_cpp2( "auto&&", n.position() );
+                    }
                 }
                 else {
                     printer.print_cpp2( return_type, n.position() );
@@ -4965,7 +5103,7 @@ public:
                 //  printer.print_cpp2( " constexpr", n.position() );
                 //      // consider enabling when P2242, P2280, and similar papers are widely implemented
             }
-            else {
+            else if (!n.my_decl->captures.members.empty()) {
                 printer.print_cpp2( " mutable", n.position() );
             }
         }
@@ -5191,7 +5329,7 @@ public:
     //
     auto emit_special_member_function(
         declaration_node const& n,
-        std::string             prefix
+        std::string const&      prefix
     )
         -> void
     {   STACKINSTR
@@ -5833,7 +5971,7 @@ public:
                 }
 
                 else {
-                    assert(!"ICE: should be unreachable - invalid alias");
+                    assert(false && "ICE: should be unreachable - invalid alias");
                 }
 
                 return;
@@ -6377,7 +6515,9 @@ public:
                     //  We shouldn't be able to get into a state where these values
                     //  exist here, if we did it's our compiler bug
                     break;case passing_style::copy:
+                          case passing_style::in_ref:
                           case passing_style::forward:
+                          case passing_style::forward_ref:
                           default:
                         errors.emplace_back( n.position(), "ICE: invalid parameter passing style, should have been rejected", true);
                     }

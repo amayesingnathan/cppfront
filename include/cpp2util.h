@@ -280,12 +280,14 @@
     #include <limits>
     #include <map>
     #include <memory>
+    #include <numeric>
     #include <new>
     #include <random>
     #include <optional>
     #if defined(CPP2_USE_SOURCE_LOCATION)
         #include <source_location>
     #endif
+    #include <ranges>
     #include <set>
     #include <span>
     #include <sstream>
@@ -302,6 +304,12 @@
     #include <vector>
 #endif
 
+//  cpp2util.h uses signed integer types for indices and container sizes
+//  so disable clang signed-to-unsigned conversion warnings in this header.
+#ifdef __clang__
+    #pragma clang diagnostic push
+    #pragma clang diagnostic ignored "-Wsign-conversion"
+#endif
 
 //-----------------------------------------------------------------------
 //
@@ -324,9 +332,44 @@
 #define CPP2_CONTINUE_BREAK(NAME)   goto CONTINUE_##NAME; CONTINUE_##NAME: continue; goto BREAK_##NAME; BREAK_##NAME: break;
                                     // these redundant goto's to avoid 'unused label' warnings
 
+//  Compiler version identification.
+// 
+//  This can use useful with 'if constexpr' to disable code known not to
+//  work on some otherwise-supported compilers (without macros), for example:
+// 
+//    //  Disable tests on lower-level compilers that have blocking bugs
+//    []<auto V = gcc_clang_msvc_min_versions(1400, 1600, 1920)> () { if constexpr (V) {
+//        // ... tests that would fail due to older compilers' bugs ...
+//    }}();
+//
+//  Note: Test Clang first because it pretends to be other compilers.
+//
+#if defined(__clang_major__)
+    constexpr auto gcc_ver   = 0;
+    constexpr auto clang_ver = __clang_major__ * 100 + __clang_minor__;
+    constexpr auto msvc_ver  = 0;
+#elif defined(_MSC_VER)
+    constexpr auto gcc_ver   = 0;
+    constexpr auto clang_ver = 0;
+    constexpr auto msvc_ver  = _MSC_VER;
+#elif defined(__GNUC__)
+    constexpr auto gcc_ver   = __GNUC__ * 100 + __GNUC_MINOR__;
+    constexpr auto clang_ver = 0;
+    constexpr auto msvc_ver  = 0;
+#endif
 
-#if defined(_MSC_VER)
-   // MSVC can't handle 'inline constexpr' yet in all cases
+constexpr auto gcc_clang_msvc_min_versions(
+    auto gcc,
+    auto clang,
+    auto msvc
+)
+{
+    return gcc_ver >= gcc || clang_ver >= clang || msvc_ver >= msvc;
+}
+
+
+#if defined(_MSC_VER) && !defined(__clang_major__)
+   // MSVC can't handle 'inline constexpr' variables yet in all cases
     #define CPP2_CONSTEXPR const
 #else
     #define CPP2_CONSTEXPR constexpr
@@ -380,7 +423,7 @@ namespace string_util {
 
 //  Break a string_view into a vector of views of simple qidentifier
 //  substrings separated by other characters
-auto split_string_list(std::string_view str)
+inline auto split_string_list(std::string_view str)
     -> std::vector<std::string_view>
 {
     std::vector<std::string_view> ret;
@@ -469,7 +512,7 @@ fixed_string(const CharT (&)[N])->fixed_string<CharT, N-1>;
 
 //  Other string utility functions.
 
-inline bool is_escaped(std::string_view s) {
+constexpr bool is_escaped(std::string_view s) {
     return 
         s.starts_with("\"") 
         && s.ends_with("\"")
@@ -649,6 +692,11 @@ concept specialization_of_template_type_and_nttp = requires (X x) {
     { specialization_of_template_helper<C>(std::forward<X>(x)) } -> std::same_as<std::true_type>;
 };
 
+template<typename X>
+concept boolean_testable = std::convertible_to<X, bool> && requires(X&& x) {
+  { !std::forward<X>(x) } -> std::convertible_to<bool>;
+};
+
 template <typename X>
 concept dereferencable = requires (X x) { *x; };
 
@@ -698,6 +746,11 @@ concept valid_custom_is_operator = predicate_member_fun<X, F, &F::op_is>
                         || brace_initializable_to<X, argument_of_op_is_t<F>> 
                       );
 
+template <typename T, typename U>
+concept has_common_type = requires (T t, U u) {
+    typename std::common_type_t<T, U>;
+};
+
 //-----------------------------------------------------------------------
 //
 //  General helpers
@@ -706,16 +759,16 @@ concept valid_custom_is_operator = predicate_member_fun<X, F, &F::op_is>
 //
 
 template <typename T>
-inline constexpr auto move(T&& t) -> decltype(auto) {
+constexpr auto move(T&& t) -> decltype(auto) {
     return std::move(t);
 }
 
-inline constexpr auto max(auto... values) {
+constexpr auto max(auto... values) {
     return std::max( { values... } );
 }
 
 template <class T, class... Ts>
-inline constexpr auto is_any = std::disjunction_v<std::is_same<T, Ts>...>;
+constexpr auto is_any = std::disjunction_v<std::is_same<T, Ts>...>;
 
 template <std::size_t Len, std::size_t Align>
 struct aligned_storage {
@@ -728,8 +781,107 @@ using deref_t = decltype(*std::declval<T&>());
 
 //  Guaranteed to be a total order, unlike built-in operator== for T*
 template <typename T>
-auto pointer_eq(T const* a, T const* b) {
+inline auto pointer_eq(T const* a, T const* b) {
     return std::compare_three_way{}(a, b) == std::strong_ordering::equal;
+}
+
+//  PRs welcome to improve this, for suggestions and background see
+//  https://www.boost.org/doc/libs/1_86_0/libs/container_hash/doc/html/hash.html#notes_hash_combine
+inline auto hash_combine(size_t& seed, size_t v) -> void
+{
+    seed ^= v + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+}
+
+
+//-----------------------------------------------------------------------
+//
+//  A type_find_if for iterating over types in parameter packs
+//
+//  Note: This implementation works around limitations in gcc <12.1,
+//  Clang <13, and MSVC <19.29. Otherwise we could avoid type_it and use
+//  a lambda with an explicit parameter type list like this:
+//
+//    template <typename... Ts, typename F>
+//    constexpr auto type_find_if(F&& fun)
+//    {
+//        std::size_t found = std::variant_npos;
+//        [&]<std::size_t... Is>(std::index_sequence<Is...>){
+//            if constexpr ((requires { {CPP2_FORWARD(fun).template operator()<Is, Ts>()} -> std::convertible_to<bool>;} && ...)) {
+//                (((CPP2_FORWARD(fun).template operator()<Is, Ts>()) && (found = Is, true)) || ...);
+//            }
+//        }(std::index_sequence_for<Ts...>());
+//        return found;
+//    }
+//
+//  Note: The internal if constexpr could have else with static_assert.
+//  Unfortunately there doesn't seem to be a way to make it work on MSVC.
+//
+//-----------------------------------------------------------------------
+//
+template <std::size_t Index, typename T>
+struct type_it {
+    using type = T;
+    inline static const std::size_t index = Index;
+};
+
+template <typename... Ts, typename F>
+constexpr auto type_find_if(F&& fun)
+{
+    std::size_t found = std::variant_npos;
+    [&]<std::size_t... Is>(std::index_sequence<Is...>){
+        if constexpr ((requires { {CPP2_FORWARD(fun)(type_it<Is, Ts>{})} -> boolean_testable;} && ...)) {
+            ((CPP2_FORWARD(fun)(type_it<Is, Ts>{}) && (found = Is, true)) || ...);
+        } 
+    }(std::index_sequence_for<Ts...>());
+    return found;
+}
+
+template <typename F, template<typename...> class C, typename... Ts>
+constexpr auto type_find_if(C<Ts...> const&, F&& fun)
+{
+    return type_find_if<Ts...>(CPP2_FORWARD(fun));
+}
+
+template <typename T, typename... Ts>
+constexpr auto variant_contains_type(std::variant<Ts...>)
+{
+    if constexpr (is_any<T, Ts...>) {
+        return std::true_type{};
+    } else {
+        return std::false_type{};
+    }
+}
+
+template <typename C, typename X>
+using constness_like_t =
+  std::conditional_t<
+    std::is_const_v<
+      std::remove_pointer_t<
+        std::remove_reference_t<X>
+      >
+    >,
+    std::add_const_t<C>,
+    std::remove_const_t<C>
+  >;
+
+template<class T, class U>
+[[nodiscard]] constexpr auto forward_like(U&& x) noexcept -> decltype(auto)
+{
+    constexpr bool is_adding_const = std::is_const_v<std::remove_reference_t<T>>;
+    if constexpr (std::is_lvalue_reference_v<T&&>)
+    {
+        if constexpr (is_adding_const)
+            return std::as_const(x);
+        else
+            return static_cast<U&>(x);
+    }
+    else
+    {
+        if constexpr (is_adding_const)
+            return std::move(std::as_const(x));
+        else
+            return std::move(x);
+    }
 }
 
 
@@ -852,7 +1004,7 @@ concept Expected = std::is_same_v<T, std::expected<typename T::value_type, typen
 
 #endif
 
-auto assert_not_null(auto&& arg CPP2_SOURCE_LOCATION_PARAM_WITH_DEFAULT) -> decltype(auto)
+constexpr auto assert_not_null(auto&& arg CPP2_SOURCE_LOCATION_PARAM_WITH_DEFAULT) -> decltype(auto)
 {
     //  NOTE: This "!= T{}" test may or may not work for STL iterators. The standard
     //        doesn't guarantee that using == and != will reliably report whether an
@@ -910,21 +1062,21 @@ auto assert_not_null(auto&& arg CPP2_SOURCE_LOCATION_PARAM_WITH_DEFAULT) -> decl
 }
 
 template<typename NumType, auto arg>
-auto assert_not_zero([[maybe_unused]] char _ CPP2_SOURCE_LOCATION_PARAM_WITH_DEFAULT) -> auto
+constexpr auto assert_not_zero([[maybe_unused]] char _ CPP2_SOURCE_LOCATION_PARAM_WITH_DEFAULT) -> auto
     CPP2_ASSERT_NOT_ZERO_IMPL
 
 template<typename NumType, auto arg>
-auto assert_not_zero([[maybe_unused]] char _ CPP2_SOURCE_LOCATION_PARAM_WITH_DEFAULT) -> auto
+constexpr auto assert_not_zero([[maybe_unused]] char _ CPP2_SOURCE_LOCATION_PARAM_WITH_DEFAULT) -> auto
 {
     return arg;
 }
 
 template<typename NumType>
-auto assert_not_zero(auto   arg CPP2_SOURCE_LOCATION_PARAM_WITH_DEFAULT) -> auto
+constexpr auto assert_not_zero(auto   arg CPP2_SOURCE_LOCATION_PARAM_WITH_DEFAULT) -> auto
     CPP2_ASSERT_NOT_ZERO_IMPL
 
 template<typename NumType>
-auto assert_not_zero(auto&& arg CPP2_SOURCE_LOCATION_PARAM_WITH_DEFAULT) -> decltype(auto)
+constexpr auto assert_not_zero(auto&& arg CPP2_SOURCE_LOCATION_PARAM_WITH_DEFAULT) -> decltype(auto)
     requires (!std::is_integral_v<CPP2_TYPEOF(arg)>
               || !std::is_integral_v<NumType>)
 {
@@ -961,19 +1113,19 @@ auto assert_not_zero(auto&& arg CPP2_SOURCE_LOCATION_PARAM_WITH_DEFAULT) -> decl
 }
 
 template<auto arg>
-auto assert_in_bounds(auto&& x CPP2_SOURCE_LOCATION_PARAM_WITH_DEFAULT) -> decltype(auto)
+constexpr auto assert_in_bounds(auto&& x CPP2_SOURCE_LOCATION_PARAM_WITH_DEFAULT) -> decltype(auto)
     CPP2_ASSERT_IN_BOUNDS_IMPL
 
 template<auto arg>
-auto assert_in_bounds(auto&& x CPP2_SOURCE_LOCATION_PARAM_WITH_DEFAULT) -> decltype(auto)
+constexpr auto assert_in_bounds(auto&& x CPP2_SOURCE_LOCATION_PARAM_WITH_DEFAULT) -> decltype(auto)
 {
     return CPP2_FORWARD(x) [ arg ];
 }
 
-auto assert_in_bounds(auto&& x, auto&& arg CPP2_SOURCE_LOCATION_PARAM_WITH_DEFAULT) -> decltype(auto)
+constexpr auto assert_in_bounds(auto&& x, auto&& arg CPP2_SOURCE_LOCATION_PARAM_WITH_DEFAULT) -> decltype(auto)
     CPP2_ASSERT_IN_BOUNDS_IMPL
 
-auto assert_in_bounds(auto&& x, auto&& arg CPP2_SOURCE_LOCATION_PARAM_WITH_DEFAULT) -> decltype(auto)
+    constexpr auto assert_in_bounds(auto&& x, auto&& arg CPP2_SOURCE_LOCATION_PARAM_WITH_DEFAULT) -> decltype(auto)
 {
     return CPP2_FORWARD(x) [ CPP2_FORWARD(arg) ];
 }
@@ -1072,7 +1224,7 @@ inline auto Uncaught_exceptions() -> int {
 }
 
 template<typename T>
-auto Dynamic_cast( [[maybe_unused]] auto&& x ) -> decltype(auto) {
+constexpr auto Dynamic_cast( [[maybe_unused]] auto&& x ) -> decltype(auto) {
 #ifdef CPP2_NO_RTTI
     type_safety.report_violation( "'as' dynamic casting is disabled with -fno-rtti" );
     return nullptr;
@@ -1082,7 +1234,7 @@ auto Dynamic_cast( [[maybe_unused]] auto&& x ) -> decltype(auto) {
 }
 
 template<typename T>
-auto Typeid() -> decltype(auto) {
+constexpr auto Typeid() -> decltype(auto) {
 #ifdef CPP2_NO_RTTI
     type_safety.report_violation( "'any' dynamic casting is disabled with -fno-rtti" );
 #else
@@ -1090,7 +1242,7 @@ auto Typeid() -> decltype(auto) {
 #endif
 }
 
-auto Typeid( [[maybe_unused]] auto&& x ) -> decltype(auto) {
+constexpr auto Typeid( [[maybe_unused]] auto&& x ) -> decltype(auto) {
 #ifdef CPP2_NO_RTTI
     type_safety.report_violation( "'typeid' is disabled with -fno-rtti" );
 #else
@@ -1211,11 +1363,11 @@ class deferred_init {
     auto destroy() -> void         { if (init) { t().~T(); }  init = false; }
 
 public:
-    deferred_init() noexcept       { }
-   ~deferred_init() noexcept       { destroy(); }
-    auto value()    noexcept -> T& { cpp2_default.enforce(init);  return t(); }
+    constexpr  deferred_init() noexcept       { }
+    constexpr ~deferred_init() noexcept       { destroy(); }
+    constexpr auto value()    noexcept -> T& { cpp2_default.enforce(init);  return t(); }
 
-    auto construct(auto&& ...args) -> void { cpp2_default.enforce(!init);  new (&data) T{CPP2_FORWARD(args)...};  init = true; }
+    constexpr auto construct(auto&& ...args) -> void { cpp2_default.enforce(!init);  new (&data) T{CPP2_FORWARD(args)...};  init = true; }
 };
 
 
@@ -1235,21 +1387,21 @@ class out {
     bool called_construct_ = false;
 
 public:
-    out(T*                 t_) noexcept :  t{ t_}, has_t{true}       { cpp2_default.enforce( t); }
-    out(deferred_init<T>* dt_) noexcept : dt{dt_}, has_t{false}      { cpp2_default.enforce(dt); }
-    out(out<T>*           ot_) noexcept : ot{ot_}, has_t{ot_->has_t} { cpp2_default.enforce(ot);
+    constexpr out(T*                 t_) noexcept :  t{ t_}, has_t{true}       { cpp2_default.enforce( t); }
+    constexpr out(deferred_init<T>* dt_) noexcept : dt{dt_}, has_t{false}      { cpp2_default.enforce(dt); }
+    constexpr out(out<T>*           ot_) noexcept : ot{ot_}, has_t{ot_->has_t} { cpp2_default.enforce(ot);
         if (has_t) {  t = ot->t;  }
         else       { dt = ot->dt; }
     }
 
-    auto called_construct() -> bool& {
+    constexpr auto called_construct() -> bool& {
         if (ot) { return ot->called_construct(); }
         else    { return called_construct_; }
     }
 
     //  In the case of an exception, if the parameter was uninitialized
     //  then leave it in the same state on exit (strong guarantee)
-    ~out() {
+    constexpr ~out() {
         if (called_construct() && uncaught_count != Uncaught_exceptions()) {
             cpp2_default.enforce(!has_t);
             dt->destroy();
@@ -1257,7 +1409,7 @@ public:
         }
     }
 
-    auto construct(auto&& ...args) -> void {
+    constexpr auto construct(auto&& ...args) -> void {
         if (has_t || called_construct()) {
             if constexpr (requires { *t = T(CPP2_FORWARD(args)...); }) {
                 cpp2_default.enforce( t );
@@ -1284,7 +1436,7 @@ public:
         }
     }
 
-    auto value() noexcept -> T& {
+    constexpr auto value() noexcept -> T& {
         if (has_t) {
             cpp2_default.enforce( t );
             return *t;
@@ -1303,7 +1455,7 @@ public:
 
 //-----------------------------------------------------------------------
 //
-//  CPP2_UFCS: Variadic macro generating a variadic lamba, oh my...
+//  CPP2_UFCS: Variadic macro generating a variadic lambda, oh my...
 //
 //-----------------------------------------------------------------------
 //
@@ -1471,8 +1623,9 @@ inline auto to_string(auto const& x) -> std::string
         return x;
     }
 
-    //  Else customize bool (prefer this over << to avoid std::boolalpha)
-    if constexpr( std::is_same_v<CPP2_TYPEOF(x), bool> ) {
+    //  Else customize convertible-to-bool - use { } to avoid narrowing
+    if constexpr( requires{ bool{x}; } ) 
+    {
         return x ? "true" : "false";
     }
 
@@ -1629,45 +1782,50 @@ constexpr auto is( X&& ) {
 //  Types
 //
 template< typename C, typename X >
-auto is( X const& x ) -> bool {
+constexpr auto is( X const& x ) -> auto {
     if constexpr (
         std::is_same_v<C, X>
         || std::is_base_of_v<C, X>
     )
     {
-        return true;
+        return std::true_type{};
     }
     else if constexpr (
-        std::is_base_of_v<X, C>
-        || (
-            std::is_polymorphic_v<C>
-            && std::is_polymorphic_v<X>
-            )
+        std::is_polymorphic_v<C>
+        && std::is_polymorphic_v<X>
     )
     {
-        if constexpr (std::is_pointer_v<X>) {
-            return Dynamic_cast<C const*>(x) != nullptr;
-        }
-        else {
-            return Dynamic_cast<C const*>(&x) != nullptr;
-        }
+        return Dynamic_cast<C const*>(&x) != nullptr;
     }
     else if constexpr (
-        requires { *x; X(); }
+        (
+            std::is_same_v<X, std::nullptr_t>
+            || requires { *x; X(); }
+        )
         && std::is_same_v<C, empty>
     )
     {
         return x == X();
     }
-    else {
+    else if constexpr (
+        std::is_pointer_v<C>
+        && std::is_pointer_v<X>
+    )
+    {
+        if (x != nullptr) {
+            return bool{is<std::remove_pointer_t<C>>(*x)};
+        }
         return false;
+    }
+    else {
+        return std::false_type{};
     }
 }
 
 
 //  Values
 //
-inline constexpr auto is( auto const& x, auto&& value ) -> bool
+constexpr auto is( auto const& x, auto&& value ) -> bool
 {
     //  Value with customized operator_is case
     if constexpr (valid_custom_is_operator<decltype(x), decltype(value)>) {
@@ -1698,7 +1856,7 @@ inline constexpr auto is( auto const& x, auto&& value ) -> bool
 //
 
 template <typename X>
-inline constexpr auto is( X const& x, bool (*value)(X const&) ) -> bool {
+constexpr auto is( X const& x, bool (*value)(X const&) ) -> bool {
     return value(x);
 }
 
@@ -1710,23 +1868,23 @@ inline constexpr auto is( X const& x, bool (*value)(X const&) ) -> bool {
 //  If it's confusing, we can switch this to <From, To>
 
 template< typename To, typename From >
-inline constexpr auto is_narrowing_v =
+constexpr auto is_narrowing_v =
     // [dcl.init.list] 7.1
     (std::is_floating_point_v<From> && std::is_integral_v<To>) ||
     // [dcl.init.list] 7.2
-    (std::is_floating_point_v<From> && std::is_floating_point_v<To> && sizeof(From) > sizeof(To)) ||
+    (std::is_floating_point_v<From> && std::is_floating_point_v<To> && sizeof(From) > sizeof(To)) || // NOLINT(misc-redundant-expression)
     // [dcl.init.list] 7.3
     (std::is_integral_v<From> && std::is_floating_point_v<To>) ||
     (std::is_enum_v<From> && std::is_floating_point_v<To>) ||
     // [dcl.init.list] 7.4
-    (std::is_integral_v<From> && std::is_integral_v<To> && sizeof(From) > sizeof(To)) ||
+    (std::is_integral_v<From> && std::is_integral_v<To> && sizeof(From) > sizeof(To)) || // NOLINT(misc-redundant-expression)
     (std::is_enum_v<From> && std::is_integral_v<To> && sizeof(From) > sizeof(To)) ||
     // [dcl.init.list] 7.5
     (std::is_pointer_v<From> && std::is_same_v<To, bool>)
     ;
 
 template< typename To, typename From >
-inline constexpr auto is_unsafe_pointer_conversion_v =
+constexpr auto is_unsafe_pointer_conversion_v =
     std::is_pointer_v<To>
     && std::is_pointer_v<From>
 // Work around Clang <= 15 C++20 mode not conforming to C++20 P0929
@@ -1738,11 +1896,11 @@ inline constexpr auto is_unsafe_pointer_conversion_v =
     ;
 
 template <typename... Ts>
-inline constexpr auto program_violates_type_safety_guarantee = sizeof...(Ts) < 0;
+constexpr auto program_violates_type_safety_guarantee = sizeof...(Ts) < 0;
 
 //  For literals we can check for safe 'narrowing' at a compile time (e.g., 1 as std::size_t)
 template< typename C, auto x >
-inline constexpr bool is_castable_v =
+constexpr bool is_castable_v =
     std::is_integral_v<C> &&
     std::is_integral_v<CPP2_TYPEOF(x)> &&
     !(static_cast<CPP2_TYPEOF(x)>(static_cast<C>(x)) != x ||
@@ -1757,7 +1915,7 @@ inline constexpr bool is_castable_v =
 
 template< typename C, auto x >
     requires (std::is_arithmetic_v<C> && std::is_arithmetic_v<CPP2_TYPEOF(x)>)
-inline constexpr auto as() -> auto
+constexpr auto as() -> auto
 {
     if constexpr ( is_castable_v<C, x> ) {
         return static_cast<C>(x);
@@ -1768,7 +1926,7 @@ inline constexpr auto as() -> auto
 
 template< typename C, auto x >
     requires (std::is_same_v<C, std::string> && std::is_integral_v<CPP2_TYPEOF(x)>)
-inline constexpr auto as() -> auto
+constexpr auto as() -> auto
 {
     return cpp2::to_string(CPP2_FORWARD(x));
 }
@@ -1782,7 +1940,7 @@ inline constexpr auto as() -> auto
     #define CPP2_SOURCE_LOCATION_ARG_AS                   CPP2_SOURCE_LOCATION_ARG
 #endif
 template< typename C >
-auto as(auto&& x CPP2_SOURCE_LOCATION_PARAM_WITH_DEFAULT_AS) -> decltype(auto)
+constexpr auto as(auto&& x CPP2_SOURCE_LOCATION_PARAM_WITH_DEFAULT_AS) -> decltype(auto)
     //  This "requires" list may need to be tweaked further. The idea is to have
     //  this function used for all the cases it's supposed to cover, but not
     //  hide user-supplied extensions (such as the ones later in this file for
@@ -1875,214 +2033,62 @@ auto as(auto&& x CPP2_SOURCE_LOCATION_PARAM_WITH_DEFAULT_AS) -> decltype(auto)
 //  std::variant is and as
 //
 
-//  Common internal helper
-//
-template<std::size_t I, typename... Ts>
-constexpr auto operator_as( std::variant<Ts...> && x ) -> decltype(auto) {
-    if constexpr (I < std::variant_size_v<std::variant<Ts...>>) {
-        return std::get<I>( x );
-    }
-    else {
-        return nonesuch;
-    }
-}
-
-template<std::size_t I, typename... Ts>
-constexpr auto operator_as( std::variant<Ts...> & x ) -> decltype(auto) {
-    if constexpr (I < std::variant_size_v<std::variant<Ts...>>) {
-        return std::get<I>( x );
-    }
-    else {
-        return nonesuch;
-    }
-}
-
-template<std::size_t I, typename... Ts>
-constexpr auto operator_as( std::variant<Ts...> const& x ) -> decltype(auto) {
-    if constexpr (I < std::variant_size_v<std::variant<Ts...>>) {
-        return std::get<I>( x );
-    }
-    else {
-        return nonesuch;
-    }
-}
-
-
-//  is Type
-//
-template<typename... Ts>
-constexpr auto operator_is( std::variant<Ts...> const& x ) {
-    return x.index();
-}
-
-template<typename T, typename... Ts>
-auto is( std::variant<Ts...> const& x );
-
-
-//  is Value
-//
-template<typename... Ts>
-constexpr auto is( std::variant<Ts...> const& x, auto&& value ) -> bool
+template< typename C, specialization_of_template<std::variant> X >
+constexpr auto is( X const& x ) -> auto
 {
-    //  Predicate case
-    if constexpr      (requires{ bool{ value(operator_as< 0>(x)) }; }) { if (x.index() ==  0) return value(operator_as< 0>(x)); }
-    else if constexpr (requires{ bool{ value(operator_as< 1>(x)) }; }) { if (x.index() ==  1) return value(operator_as< 1>(x)); }
-    else if constexpr (requires{ bool{ value(operator_as< 2>(x)) }; }) { if (x.index() ==  2) return value(operator_as< 2>(x)); }
-    else if constexpr (requires{ bool{ value(operator_as< 3>(x)) }; }) { if (x.index() ==  3) return value(operator_as< 3>(x)); }
-    else if constexpr (requires{ bool{ value(operator_as< 4>(x)) }; }) { if (x.index() ==  4) return value(operator_as< 4>(x)); }
-    else if constexpr (requires{ bool{ value(operator_as< 5>(x)) }; }) { if (x.index() ==  5) return value(operator_as< 5>(x)); }
-    else if constexpr (requires{ bool{ value(operator_as< 6>(x)) }; }) { if (x.index() ==  6) return value(operator_as< 6>(x)); }
-    else if constexpr (requires{ bool{ value(operator_as< 7>(x)) }; }) { if (x.index() ==  7) return value(operator_as< 7>(x)); }
-    else if constexpr (requires{ bool{ value(operator_as< 8>(x)) }; }) { if (x.index() ==  8) return value(operator_as< 8>(x)); }
-    else if constexpr (requires{ bool{ value(operator_as< 9>(x)) }; }) { if (x.index() ==  9) return value(operator_as< 9>(x)); }
-    else if constexpr (requires{ bool{ value(operator_as<10>(x)) }; }) { if (x.index() == 10) return value(operator_as<10>(x)); }
-    else if constexpr (requires{ bool{ value(operator_as<11>(x)) }; }) { if (x.index() == 11) return value(operator_as<11>(x)); }
-    else if constexpr (requires{ bool{ value(operator_as<12>(x)) }; }) { if (x.index() == 12) return value(operator_as<12>(x)); }
-    else if constexpr (requires{ bool{ value(operator_as<13>(x)) }; }) { if (x.index() == 13) return value(operator_as<13>(x)); }
-    else if constexpr (requires{ bool{ value(operator_as<14>(x)) }; }) { if (x.index() == 14) return value(operator_as<14>(x)); }
-    else if constexpr (requires{ bool{ value(operator_as<15>(x)) }; }) { if (x.index() == 15) return value(operator_as<15>(x)); }
-    else if constexpr (requires{ bool{ value(operator_as<16>(x)) }; }) { if (x.index() == 16) return value(operator_as<16>(x)); }
-    else if constexpr (requires{ bool{ value(operator_as<17>(x)) }; }) { if (x.index() == 17) return value(operator_as<17>(x)); }
-    else if constexpr (requires{ bool{ value(operator_as<18>(x)) }; }) { if (x.index() == 18) return value(operator_as<18>(x)); }
-    else if constexpr (requires{ bool{ value(operator_as<19>(x)) }; }) { if (x.index() == 19) return value(operator_as<19>(x)); }
-    else if constexpr (std::is_function_v<decltype(value)> || requires{ &value.operator(); }) {
-        return false;
+    if constexpr (
+        std::is_same_v<C, X>
+        || std::is_base_of_v<C, X>
+    )
+    {
+        return std::true_type{};
     }
-
-    //  Value case
     else {
-        if constexpr (requires{ bool{ operator_as< 0>(x) == value }; }) { if (x.index() ==  0) return operator_as< 0>(x) == value; }
-        if constexpr (requires{ bool{ operator_as< 1>(x) == value }; }) { if (x.index() ==  1) return operator_as< 1>(x) == value; }
-        if constexpr (requires{ bool{ operator_as< 2>(x) == value }; }) { if (x.index() ==  2) return operator_as< 2>(x) == value; }
-        if constexpr (requires{ bool{ operator_as< 3>(x) == value }; }) { if (x.index() ==  3) return operator_as< 3>(x) == value; }
-        if constexpr (requires{ bool{ operator_as< 4>(x) == value }; }) { if (x.index() ==  4) return operator_as< 4>(x) == value; }
-        if constexpr (requires{ bool{ operator_as< 5>(x) == value }; }) { if (x.index() ==  5) return operator_as< 5>(x) == value; }
-        if constexpr (requires{ bool{ operator_as< 6>(x) == value }; }) { if (x.index() ==  6) return operator_as< 6>(x) == value; }
-        if constexpr (requires{ bool{ operator_as< 7>(x) == value }; }) { if (x.index() ==  7) return operator_as< 7>(x) == value; }
-        if constexpr (requires{ bool{ operator_as< 8>(x) == value }; }) { if (x.index() ==  8) return operator_as< 8>(x) == value; }
-        if constexpr (requires{ bool{ operator_as< 9>(x) == value }; }) { if (x.index() ==  9) return operator_as< 9>(x) == value; }
-        if constexpr (requires{ bool{ operator_as<10>(x) == value }; }) { if (x.index() == 10) return operator_as<10>(x) == value; }
-        if constexpr (requires{ bool{ operator_as<11>(x) == value }; }) { if (x.index() == 11) return operator_as<11>(x) == value; }
-        if constexpr (requires{ bool{ operator_as<12>(x) == value }; }) { if (x.index() == 12) return operator_as<12>(x) == value; }
-        if constexpr (requires{ bool{ operator_as<13>(x) == value }; }) { if (x.index() == 13) return operator_as<13>(x) == value; }
-        if constexpr (requires{ bool{ operator_as<14>(x) == value }; }) { if (x.index() == 14) return operator_as<14>(x) == value; }
-        if constexpr (requires{ bool{ operator_as<15>(x) == value }; }) { if (x.index() == 15) return operator_as<15>(x) == value; }
-        if constexpr (requires{ bool{ operator_as<16>(x) == value }; }) { if (x.index() == 16) return operator_as<16>(x) == value; }
-        if constexpr (requires{ bool{ operator_as<17>(x) == value }; }) { if (x.index() == 17) return operator_as<17>(x) == value; }
-        if constexpr (requires{ bool{ operator_as<18>(x) == value }; }) { if (x.index() == 18) return operator_as<18>(x) == value; }
-        if constexpr (requires{ bool{ operator_as<19>(x) == value }; }) { if (x.index() == 19) return operator_as<19>(x) == value; }
+        if (x.valueless_by_exception()) {
+            return std::is_same_v<C, empty>;
+        }
+        if constexpr (
+            std::is_same_v<C, empty>
+        )
+        {
+            if constexpr (requires { {variant_contains_type<std::monostate>(std::declval<X>())} -> std::same_as<std::true_type>; }) {
+                return std::get_if<std::monostate>(&x) != nullptr;
+            }
+        }
+        return type_find_if(x, [&]<typename It>(It const&) -> bool {
+            if (x.index() == It::index) { return std::is_same_v<C, std::variant_alternative_t<It::index, X>>;}
+            return false;
+        }) != std::variant_npos;
     }
-    return false;
 }
 
 
-//  as
-//
-template<typename T, typename... Ts>
-auto is( std::variant<Ts...> const& x ) {
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 0>(x)), T >) { if (x.index() ==  0) return true; }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 1>(x)), T >) { if (x.index() ==  1) return true; }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 2>(x)), T >) { if (x.index() ==  2) return true; }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 3>(x)), T >) { if (x.index() ==  3) return true; }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 4>(x)), T >) { if (x.index() ==  4) return true; }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 5>(x)), T >) { if (x.index() ==  5) return true; }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 6>(x)), T >) { if (x.index() ==  6) return true; }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 7>(x)), T >) { if (x.index() ==  7) return true; }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 8>(x)), T >) { if (x.index() ==  8) return true; }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 9>(x)), T >) { if (x.index() ==  9) return true; }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<10>(x)), T >) { if (x.index() == 10) return true; }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<11>(x)), T >) { if (x.index() == 11) return true; }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<12>(x)), T >) { if (x.index() == 12) return true; }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<13>(x)), T >) { if (x.index() == 13) return true; }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<14>(x)), T >) { if (x.index() == 14) return true; }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<15>(x)), T >) { if (x.index() == 15) return true; }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<16>(x)), T >) { if (x.index() == 16) return true; }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<17>(x)), T >) { if (x.index() == 17) return true; }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<18>(x)), T >) { if (x.index() == 18) return true; }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<19>(x)), T >) { if (x.index() == 19) return true; }
-    if constexpr (std::is_same_v< T, empty > ) {
-        if (x.valueless_by_exception()) return true;
-        //  Need to guard this with is_any otherwise the get_if is illegal
-        if constexpr (is_any<std::monostate, Ts...>) return std::get_if<std::monostate>(&x) != nullptr;
-    }
-    return false;
+template <specialization_of_template<std::variant> X>
+constexpr auto is( X const& x, auto&& value ) -> bool
+{
+    return type_find_if(x, [&]<typename It>(It const&) -> bool {
+        if (x.index() == It::index) {
+            if constexpr (valid_predicate<decltype(value), decltype(std::get<It::index>(x))>) {
+                return value(std::get<It::index>(x));
+            } else if constexpr ( requires { bool{std::get<It::index>(x) == value}; }  ) {
+                return std::get<It::index>(x) == value;
+            }
+        }
+        return false;
+    }) != std::variant_npos;
 }
 
-template<typename T, typename... Ts>
-auto as( std::variant<Ts...> && x ) -> decltype(auto) {
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 0>(x)), T >) { if (x.index() ==  0) return operator_as<0>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 1>(x)), T >) { if (x.index() ==  1) return operator_as<1>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 2>(x)), T >) { if (x.index() ==  2) return operator_as<2>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 3>(x)), T >) { if (x.index() ==  3) return operator_as<3>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 4>(x)), T >) { if (x.index() ==  4) return operator_as<4>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 5>(x)), T >) { if (x.index() ==  5) return operator_as<5>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 6>(x)), T >) { if (x.index() ==  6) return operator_as<6>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 7>(x)), T >) { if (x.index() ==  7) return operator_as<7>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 8>(x)), T >) { if (x.index() ==  8) return operator_as<8>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 9>(x)), T >) { if (x.index() ==  9) return operator_as<9>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<10>(x)), T >) { if (x.index() == 10) return operator_as<10>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<11>(x)), T >) { if (x.index() == 11) return operator_as<11>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<12>(x)), T >) { if (x.index() == 12) return operator_as<12>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<13>(x)), T >) { if (x.index() == 13) return operator_as<13>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<14>(x)), T >) { if (x.index() == 14) return operator_as<14>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<15>(x)), T >) { if (x.index() == 15) return operator_as<15>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<16>(x)), T >) { if (x.index() == 16) return operator_as<16>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<17>(x)), T >) { if (x.index() == 17) return operator_as<17>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<18>(x)), T >) { if (x.index() == 18) return operator_as<18>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<19>(x)), T >) { if (x.index() == 19) return operator_as<19>(x); }
-    Throw( std::bad_variant_access(), "'as' cast failed for 'variant'");
+template< typename C, specialization_of_template<std::variant> X >
+auto as(X&& x CPP2_SOURCE_LOCATION_PARAM_WITH_DEFAULT_AS) -> decltype(auto)
+{
+    constness_like_t<C, decltype(x)>* ptr = nullptr;
+    type_find_if(CPP2_FORWARD(x), [&]<typename It>(It const&) -> bool {
+        if constexpr (std::is_same_v< typename It::type, C >) { if (CPP2_FORWARD(x).index() ==  It::index) { ptr = &std::get<It::index>(x); return true; } }; 
+        return false;
+    });
+    if (!ptr) { Throw( std::bad_variant_access(), "'as' cast failed for 'variant'"); }
+    return cpp2::forward_like<decltype(x)>(*ptr);
 }
-
-template<typename T, typename... Ts>
-auto as( std::variant<Ts...> & x ) -> decltype(auto) {
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 0>(x)), T >) { if (x.index() ==  0) return operator_as<0>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 1>(x)), T >) { if (x.index() ==  1) return operator_as<1>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 2>(x)), T >) { if (x.index() ==  2) return operator_as<2>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 3>(x)), T >) { if (x.index() ==  3) return operator_as<3>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 4>(x)), T >) { if (x.index() ==  4) return operator_as<4>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 5>(x)), T >) { if (x.index() ==  5) return operator_as<5>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 6>(x)), T >) { if (x.index() ==  6) return operator_as<6>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 7>(x)), T >) { if (x.index() ==  7) return operator_as<7>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 8>(x)), T >) { if (x.index() ==  8) return operator_as<8>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 9>(x)), T >) { if (x.index() ==  9) return operator_as<9>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<10>(x)), T >) { if (x.index() == 10) return operator_as<10>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<11>(x)), T >) { if (x.index() == 11) return operator_as<11>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<12>(x)), T >) { if (x.index() == 12) return operator_as<12>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<13>(x)), T >) { if (x.index() == 13) return operator_as<13>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<14>(x)), T >) { if (x.index() == 14) return operator_as<14>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<15>(x)), T >) { if (x.index() == 15) return operator_as<15>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<16>(x)), T >) { if (x.index() == 16) return operator_as<16>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<17>(x)), T >) { if (x.index() == 17) return operator_as<17>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<18>(x)), T >) { if (x.index() == 18) return operator_as<18>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<19>(x)), T >) { if (x.index() == 19) return operator_as<19>(x); }
-    Throw( std::bad_variant_access(), "'as' cast failed for 'variant'");
-}
-
-template<typename T, typename... Ts>
-auto as( std::variant<Ts...> const& x ) -> decltype(auto) {
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 0>(x)), T >) { if (x.index() ==  0) return operator_as<0>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 1>(x)), T >) { if (x.index() ==  1) return operator_as<1>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 2>(x)), T >) { if (x.index() ==  2) return operator_as<2>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 3>(x)), T >) { if (x.index() ==  3) return operator_as<3>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 4>(x)), T >) { if (x.index() ==  4) return operator_as<4>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 5>(x)), T >) { if (x.index() ==  5) return operator_as<5>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 6>(x)), T >) { if (x.index() ==  6) return operator_as<6>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 7>(x)), T >) { if (x.index() ==  7) return operator_as<7>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 8>(x)), T >) { if (x.index() ==  8) return operator_as<8>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as< 9>(x)), T >) { if (x.index() ==  9) return operator_as<9>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<10>(x)), T >) { if (x.index() == 10) return operator_as<10>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<11>(x)), T >) { if (x.index() == 11) return operator_as<11>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<12>(x)), T >) { if (x.index() == 12) return operator_as<12>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<13>(x)), T >) { if (x.index() == 13) return operator_as<13>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<14>(x)), T >) { if (x.index() == 14) return operator_as<14>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<15>(x)), T >) { if (x.index() == 15) return operator_as<15>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<16>(x)), T >) { if (x.index() == 16) return operator_as<16>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<17>(x)), T >) { if (x.index() == 17) return operator_as<17>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<18>(x)), T >) { if (x.index() == 18) return operator_as<18>(x); }
-    if constexpr (std::is_same_v< CPP2_TYPEOF(operator_as<19>(x)), T >) { if (x.index() == 19) return operator_as<19>(x); }
-    Throw( std::bad_variant_access(), "'as' cast failed for 'variant'");
-}
-
 
 //-------------------------------------------------------------------------------------------------------------
 //  std::any is and as
@@ -2090,27 +2096,21 @@ auto as( std::variant<Ts...> const& x ) -> decltype(auto) {
 
 //  is Type
 //
-template<typename T, typename X>
-    requires (std::is_same_v<X,std::any> && !std::is_same_v<T,std::any> && !std::is_same_v<T,empty>)
-constexpr auto is( X const& x ) -> bool
-    { return x.type() == Typeid<T>(); }
-
-template<typename T, typename X>
-    requires (std::is_same_v<X,std::any> && std::is_same_v<T,empty>)
-constexpr auto is( X const& x ) -> bool
-    { return !x.has_value(); }
-
+template<typename T, std::same_as<std::any> X>
+constexpr auto is( X const& x ) -> bool{
+    if (!x.has_value()) {
+        return std::is_same_v<T,empty>;
+    }
+    return x.type() == Typeid<T>(); 
+}
 
 //  is Value
 //
-inline constexpr auto is( std::any const& x, auto&& value ) -> bool
+constexpr auto is( std::any const& x, auto&& value ) -> bool
 {
     //  Predicate case
-    if constexpr (requires{ bool{ value(x) }; }) {
+    if constexpr (valid_predicate<decltype(value), decltype(x)>) {
         return value(x);
-    }
-    else if constexpr (std::is_function_v<decltype(value)> || requires{ &value.operator(); }) {
-        return false;
     }
 
     //  Value case
@@ -2125,10 +2125,12 @@ inline constexpr auto is( std::any const& x, auto&& value ) -> bool
 
 //  as
 //
-template<typename T, typename X>
-    requires (!std::is_reference_v<T> && std::is_same_v<X,std::any> && !std::is_same_v<T,std::any>)
-constexpr auto as( X const& x ) -> T
-    { return std::any_cast<T>( x ); }
+template<typename T, same_type_as<std::any> X>
+constexpr auto as( X && x ) -> decltype(auto) {
+    constness_like_t<T, X>* ptr = std::any_cast<T>( &x );
+    if (!ptr) { Throw( std::bad_any_cast(), "'as' cast failed for 'std::any'"); }
+    return cpp2::forward_like<X>(*ptr);
+}
 
 
 //-------------------------------------------------------------------------------------------------------------
@@ -2137,16 +2139,16 @@ constexpr auto as( X const& x ) -> T
 
 //  is Type
 //
-template<typename T, typename X>
-    requires std::is_same_v<X,std::optional<T>>
-constexpr auto is( X const& x ) -> bool
-    { return x.has_value(); }
-
-template<typename T, typename U>
-    requires std::is_same_v<T,empty>
-constexpr auto is( std::optional<U> const& x ) -> bool
-    { return !x.has_value(); }
-
+template<typename T, specialization_of_template<std::optional> X>
+constexpr auto is( X const& x ) -> bool { 
+    if (!x.has_value()) {
+        return std::same_as<T, empty>;
+    }
+    if constexpr (requires { static_cast<const T&>(*x);}) {
+        return true;
+    }
+    return false;
+}
 
 //  is Value
 //
@@ -2154,11 +2156,8 @@ template<typename T>
 constexpr auto is( std::optional<T> const& x, auto&& value ) -> bool
 {
     //  Predicate case
-    if constexpr (requires{ bool{ value(x) }; }) {
+    if constexpr (valid_predicate<decltype(value), decltype(x)>) {
         return value(x);
-    }
-    else if constexpr (std::is_function_v<decltype(value)> || requires{ &value.operator(); }) {
-        return false;
     }
 
     //  Value case
@@ -2171,10 +2170,17 @@ constexpr auto is( std::optional<T> const& x, auto&& value ) -> bool
 
 //  as
 //
-template<typename T, typename X>
-    requires std::is_same_v<X,std::optional<T>>
-constexpr auto as( X const& x ) -> decltype(auto)
-    { return x.value(); }
+template<typename T, specialization_of_template<std::optional> X>
+constexpr auto as( X&& x ) -> decltype(auto) { 
+    constness_like_t<T, X>* ptr = nullptr;
+    if constexpr (requires { static_cast<constness_like_t<T, X>&>(*x); }) {
+        if (x.has_value()) {
+            ptr = &static_cast<constness_like_t<T, X>&>(*x);
+        }
+    }
+    if (!ptr) { Throw( std::bad_optional_access(), "'as' cast failed for 'std::optional'"); }
+    return cpp2::forward_like<X>(*ptr);
+}
 
 
 } // impl
@@ -2201,17 +2207,17 @@ template <class F>
 class finally_success
 {
 public:
-    explicit finally_success(const F& ff) noexcept : f{ff} { }
-    explicit finally_success(F&& ff) noexcept : f{std::move(ff)} { }
+    constexpr explicit finally_success(const F& ff) noexcept : f{ff} { }
+    constexpr explicit finally_success(F&& ff) noexcept : f{std::move(ff)} { }
 
-    ~finally_success() noexcept
+    constexpr ~finally_success() noexcept
     {
         if (invoke && ecount == std::uncaught_exceptions()) {
             f();
         }
     }
 
-    finally_success(finally_success&& that) noexcept
+    constexpr finally_success(finally_success&& that) noexcept
         : f(std::move(that.f)), invoke(std::exchange(that.invoke, false))
     { }
 
@@ -2230,12 +2236,12 @@ template <class F>
 class finally
 {
 public:
-    explicit finally(const F& ff) noexcept : f{ff} { }
-    explicit finally(F&& ff) noexcept : f{std::move(ff)} { }
+    constexpr explicit finally(const F& ff) noexcept : f{ff} { }
+    constexpr explicit finally(F&& ff) noexcept : f{std::move(ff)} { }
 
-    ~finally() noexcept { f(); }
+    constexpr ~finally() noexcept { f(); }
 
-    finally(finally&& that) noexcept
+    constexpr finally(finally&& that) noexcept
         : f(std::move(that.f)), invoke(std::exchange(that.invoke, false))
     { }
 
@@ -2284,12 +2290,12 @@ private:
 
 //-----------------------------------------------------------------------
 //
-//  An implementation of GSL's narrow_cast with a clearly 'unsafe' name
+//  An implementation of GSL's narrow_cast with a clearly 'unchecked' name
 //
 //-----------------------------------------------------------------------
 //
 template <typename C, typename X>
-constexpr auto unsafe_narrow( X x ) noexcept 
+constexpr auto unchecked_narrow( X x ) noexcept 
     -> decltype(auto)
     requires (
         impl::is_narrowing_v<C, X>
@@ -2304,7 +2310,7 @@ constexpr auto unsafe_narrow( X x ) noexcept
 
 
 template <typename C, typename X>
-constexpr auto unsafe_cast( X&& x ) noexcept 
+constexpr auto unchecked_cast( X&& x ) noexcept 
     -> decltype(auto)
 {
     return static_cast<C>(CPP2_FORWARD(x));
@@ -2325,28 +2331,28 @@ constexpr auto unsafe_cast( X&& x ) noexcept
 //
 struct args
 {
-    args(int c, char** v) : argc{c}, argv{v} {}
+    constexpr args(int c, char** v) : argc{c}, argv{v} {}
 
     class iterator {
     public:
-        iterator(int c, char** v, int start) : argc{c}, argv{v}, curr{start} {}
+        constexpr iterator(int c, char** v, int start) : argc{c}, argv{v}, curr{start} {}
 
-        auto operator*() const {
+        constexpr auto operator*() const {
             if (curr < argc) { return std::string_view{ argv[curr] }; }
             else             { return std::string_view{}; }
         }
 
-        auto operator+(int i) -> iterator  {
+        constexpr auto operator+(int i) -> iterator  {
             if (i > 0) { return { argc, argv, std::min(curr+i, argc) }; }
             else       { return { argc, argv, std::max(curr+i, 0   ) }; }
         }
-        auto operator-(int i) -> iterator  { return operator+(-i); }
-        auto operator++()     -> iterator& { curr = std::min(curr+1, argc);  return *this; }
-        auto operator--()     -> iterator& { curr = std::max(curr-1, 0   );  return *this; }
-        auto operator++(int)  -> iterator  { auto old = *this;  ++*this;  return old; }
-        auto operator--(int)  -> iterator  { auto old = *this;  ++*this;  return old; }
+        constexpr auto operator-(int i) -> iterator  { return operator+(-i); }
+        constexpr auto operator++()     -> iterator& { curr = std::min(curr+1, argc);  return *this; }
+        constexpr auto operator--()     -> iterator& { curr = std::max(curr-1, 0   );  return *this; }
+        constexpr auto operator++(int)  -> iterator  { auto old = *this;  ++*this;  return old; }
+        constexpr auto operator--(int)  -> iterator  { auto old = *this;  ++*this;  return old; }
 
-        auto operator<=>(iterator const&) const = default;
+        constexpr auto operator<=>(iterator const&) const = default;
 
     private:
         int    argc;
@@ -2354,23 +2360,23 @@ struct args
         int    curr;
     };
 
-    auto begin()  const -> iterator       { return iterator{ argc, argv, 0    }; }
-    auto end()    const -> iterator       { return iterator{ argc, argv, argc }; }
-    auto cbegin() const -> iterator       { return begin(); }
-    auto cend()   const -> iterator       { return end(); }
-    auto size()   const -> std::size_t    { return cpp2::unsafe_narrow<std::size_t>(ssize()); }
-    auto ssize()  const -> std::ptrdiff_t { return argc; }
+    constexpr auto begin()  const -> iterator       { return iterator{ argc, argv, 0    }; }
+    constexpr auto end()    const -> iterator       { return iterator{ argc, argv, argc }; }
+    constexpr auto cbegin() const -> iterator       { return begin(); }
+    constexpr auto cend()   const -> iterator       { return end(); }
+    constexpr auto size()   const -> std::size_t    { return cpp2::unchecked_narrow<std::size_t>(ssize()); }
+    constexpr auto ssize()  const -> std::ptrdiff_t { return argc; }
 
-    auto operator[](int i) const {
+    constexpr auto operator[](int i) const {
         if (0 <= i && i < ssize())        { return std::string_view{ argv[i] }; }
         else                              { return std::string_view{}; }
     }
 
-    mutable int        argc = 0;        //  mutable for compatibility with frameworks that take 'int& argc'
+    mutable int        argc = 0;        //  'mutable' is for compatibility with frameworks that take 'int& argc'
     char**             argv = nullptr;
 };
 
-inline auto make_args(int argc, char** argv) -> args
+constexpr auto make_args(int argc, char** argv) -> args
 {
     return args{argc, argv};
 }
@@ -2414,7 +2420,7 @@ public:
     using pointer         = T*;
     using reference       = T&;
 
-    range(
+    constexpr range(
         T const&                       f,
         std::type_identity_t<T> const& l,
         bool                           include_last = false
@@ -2428,13 +2434,26 @@ public:
             if constexpr (std::integral<TT>) {
                 if (last == std::numeric_limits<TT>::max()) {
                     throw std::runtime_error(
-                        "range with last == numeric_limits<T>::max() will "
-                        "overflow");
+                        "range with last == numeric_limits<T>::max() will overflow"
+                    );
                 }
             }
             ++last; 
         }
     }
+
+    //  When the first & last types are different, use a CTAD deduction guide
+    //  to find the `std::common_type` for them, if one exists. See below
+    //  after the class definition for the deduction guide.
+    template <typename U>
+        requires has_common_type<T, U>
+    range(
+        T const& f,
+        U const& l,
+        bool     include_last = false
+    )
+        : range(f, l, include_last)
+    {}
 
     class iterator 
     {
@@ -2459,23 +2478,25 @@ public:
         using reference         = T&;
         using iterator_category = typename range_iterator_category<T>::tag;
 
-        iterator() { }
+        constexpr iterator() { }
 
-        iterator(TT const& f, TT const& l, TT start) : first{ f }, last{ l }, curr{ start } {}
+        constexpr iterator(TT const& f, TT const& l, TT start) : first{ f }, last{ l }, curr{ start } {}
 
         auto operator<=>(iterator const&) const = default;
+
+        constexpr operator typename range<const T>::iterator() const { return {first, last, curr}; }
 
         //  In this section, we don't use relational comparisons so that
         //  this works when T is a less-powerful-than-random-access iterator
         //
-        auto operator*() const -> T
+        constexpr auto operator*() const -> T
         {
             if (curr != last) { 
                 if constexpr (std::is_same_v<T, TT>) { 
                     return curr;
                 }
                 else {
-                    return unsafe_narrow<T>(curr);
+                    return unchecked_narrow<T>(curr);
                 }
             }
             else { 
@@ -2483,21 +2504,21 @@ public:
             }
         }
 
-        auto operator++()    -> iterator& { if (curr != last ) { ++curr; }  return *this; }
-        auto operator--()    -> iterator& { if (curr != first) { --curr; }  return *this; }
-        auto operator++(int) -> iterator  { auto old = *this;  ++*this;  return old; }
-        auto operator--(int) -> iterator  { auto old = *this;  ++*this;  return old; }
+        constexpr auto operator++()    -> iterator& { if (curr != last ) { ++curr; }  return *this; }
+        constexpr auto operator--()    -> iterator& { if (curr != first) { --curr; }  return *this; }
+        constexpr auto operator++(int) -> iterator  { auto old = *this;  ++*this;  return old; }
+        constexpr auto operator--(int) -> iterator  { auto old = *this;  ++*this;  return old; }
 
         //  And now all the random-access operations which can use relational
         //  comparisons (these functions are valid if T is random-access)
         //
-        auto operator[](difference_type i) const -> T {
+        constexpr auto operator[](difference_type i) const -> T {
             if (curr + i != last) { 
                 if constexpr (std::is_same_v<T, TT>) { 
                     return curr + i;
                 }
                 else {
-                    return unsafe_narrow<T>(curr + i);
+                    return unchecked_narrow<T>(curr + i);
                 }
             }
             else {
@@ -2505,35 +2526,62 @@ public:
             }
         }
 
-        auto operator+=(difference_type i) -> iterator& 
+        constexpr auto operator+=(difference_type i) -> iterator& 
             { if (curr + i <= last ) { curr += i; } else { curr = last;  }  return *this; }
-        auto operator-=(difference_type i) -> iterator& 
+        constexpr auto operator-=(difference_type i) -> iterator& 
             { if (curr - i >= first) { curr -= i; } else { curr = first; }  return *this; }
 
         friend 
-        auto operator+ (difference_type i, iterator const& iter) -> iterator 
+        constexpr auto operator+ (difference_type i, iterator const& iter) -> iterator 
             { auto ret = *iter;  return ret += i; }
 
-        auto operator+ (difference_type i   ) const -> iterator        { auto ret = *this;  return ret += i; }
-        auto operator- (difference_type i   ) const -> iterator        { auto ret = *this;  return ret -= i; }
-        auto operator- (iterator        that) const -> difference_type { return that.curr - curr; }
+        constexpr auto operator+ (difference_type i   ) const -> iterator        { auto ret = *this;  return ret += i; }
+        constexpr auto operator- (difference_type i   ) const -> iterator        { auto ret = *this;  return ret -= i; }
+        constexpr auto operator- (iterator        that) const -> difference_type { return that.curr - curr; }
     };
 
-    auto begin()  const -> iterator       { return iterator{ first, last, first }; }
-    auto end()    const -> iterator       { return iterator{ first, last, last }; }
-    auto cbegin() const -> iterator       { return begin(); }
-    auto cend()   const -> iterator       { return end(); }
-    auto size()   const -> std::size_t    { return unsafe_narrow<std::size_t>(ssize()); }
-    auto ssize()  const -> std::ptrdiff_t { return last - first; }
+    using const_iterator = typename range<const T>::iterator;
 
-    auto operator[](difference_type i) const -> T
+    constexpr auto cbegin() const -> const_iterator { return begin(); }
+    constexpr auto cend()   const -> const_iterator { return end(); }
+    constexpr auto begin()  const -> const_iterator { return iterator{ first, last, first }; }
+    constexpr auto end()    const -> const_iterator { return iterator{ first, last, last }; }
+    constexpr auto begin()        -> iterator       { return iterator{ first, last, first }; }
+    constexpr auto end()          -> iterator       { return iterator{ first, last, last }; }
+    constexpr auto size()   const -> std::size_t    { return unchecked_narrow<std::size_t>(ssize()); }
+    constexpr auto ssize()  const -> std::ptrdiff_t { return last - first; }
+    constexpr auto empty()  const -> bool           { return first == last; }
+
+    constexpr auto front() const -> T { 
+        type_safety.enforce(!empty()); 
+        if constexpr (std::is_same_v<T, TT>) { 
+            return first;
+        }
+        else {
+            return unchecked_narrow<T>(first);
+        }
+    }
+
+    constexpr auto back() const -> T { 
+        type_safety.enforce(!empty()); 
+        if constexpr (std::is_same_v<T, TT>) { 
+            auto ret = last; 
+            return --ret;
+        }
+        else {
+            auto ret = unchecked_narrow<T>(last);
+            return --ret;
+        }
+    }
+
+    constexpr auto operator[](difference_type i) const -> T
     {
         if (0 <= i && i < ssize()) { 
             if constexpr (std::is_same_v<T, TT>) { 
                 return first + i;
             }
             else {
-                return unsafe_narrow<T>(first + i);
+                return unchecked_narrow<T>(first + i);
             }
         }
         else { 
@@ -2541,6 +2589,33 @@ public:
         }
     }
 };
+
+//  CTAD deduction guide for the `range` constructor that takes two different types.
+//  Deduces the `std::common_type` for them, if one exists.
+template <typename T, typename U>
+    requires has_common_type<T, U>
+range(
+    T const& f,
+    U const& l,
+    bool     include_last = false
+) -> range<std::common_type_t<T, U>>;
+
+template<typename T>
+constexpr auto contains(range<T> const& r, auto const& t)
+    -> bool
+{
+    if (r.empty()) {
+        return false;
+    }
+    return r.front() <= t && t <= r.back();
+}
+
+template<typename T>
+constexpr auto sum(range<T> const& r)
+    -> T 
+{ 
+    return std::accumulate(r.begin(), r.end(), T{});
+}
 
 
 //-----------------------------------------------------------------------
@@ -2567,7 +2642,7 @@ using alien_memory = T volatile;
 //-----------------------------------------------------------------------
 //
 template <typename T>
-auto has_flags(T flags)
+constexpr auto has_flags(T flags)
 {
     return [=](T value) { return (value & flags) == flags; };
 }
@@ -2636,6 +2711,64 @@ inline auto fopen( const char* filename, const char* mode ) {
 
 
 
+
+//-----------------------------------------------------------------------
+//
+//  "Unchecked" opt-outs for safety checks
+//
+//-----------------------------------------------------------------------
+//
+
+CPP2_FORCE_INLINE constexpr auto unchecked_cmp_less(auto&& t, auto&& u) 
+    -> decltype(auto)
+    requires requires {CPP2_FORWARD(t) < CPP2_FORWARD(u);}
+{
+    return CPP2_FORWARD(t) < CPP2_FORWARD(u);
+}
+
+CPP2_FORCE_INLINE constexpr auto unchecked_cmp_less_eq(auto&& t, auto&& u) 
+    -> decltype(auto)
+    requires requires {CPP2_FORWARD(t) <= CPP2_FORWARD(u);}
+{
+    return CPP2_FORWARD(t) <= CPP2_FORWARD(u);
+}
+
+CPP2_FORCE_INLINE constexpr auto unchecked_cmp_greater(auto&& t, auto&& u) 
+    -> decltype(auto)
+    requires requires {CPP2_FORWARD(t) > CPP2_FORWARD(u);}
+{
+    return CPP2_FORWARD(t) > CPP2_FORWARD(u);
+}
+
+CPP2_FORCE_INLINE constexpr auto unchecked_cmp_greater_eq(auto&& t, auto&& u) 
+    -> decltype(auto)
+    requires requires {CPP2_FORWARD(t) >= CPP2_FORWARD(u);}
+{
+    return CPP2_FORWARD(t) >= CPP2_FORWARD(u);
+}
+
+CPP2_FORCE_INLINE constexpr auto unchecked_div(auto&& t, auto&& u) 
+    -> decltype(auto)
+    requires requires {CPP2_FORWARD(t) / CPP2_FORWARD(u);}
+{
+    return CPP2_FORWARD(t) / CPP2_FORWARD(u);
+}
+
+CPP2_FORCE_INLINE constexpr auto unchecked_dereference(auto&& p) 
+-> decltype(auto)
+    requires requires {*CPP2_FORWARD(p);}
+{
+    return *CPP2_FORWARD(p);
+}
+
+CPP2_FORCE_INLINE constexpr auto unchecked_subscript(auto&& a, auto&& b) 
+    -> decltype(auto)
+    requires requires {CPP2_FORWARD(a)[b];}
+{
+    return CPP2_FORWARD(a)[b];
+}
+
+
 namespace impl {
 
 //-----------------------------------------------------------------------
@@ -2654,7 +2787,8 @@ CPP2_FORCE_INLINE constexpr auto cmp_mixed_signedness_check() -> void
     {
         static_assert(
             program_violates_type_safety_guarantee<T, U>,
-            "comparing bool values using < <= >= > is unsafe and not allowed - are you missing parentheses?");
+            "comparing bool values using < <= >= > is unsafe and not allowed - are you missing parentheses?"
+            );
     }
     else if constexpr (
         std::is_integral_v<T> &&
@@ -2670,20 +2804,22 @@ CPP2_FORCE_INLINE constexpr auto cmp_mixed_signedness_check() -> void
         //  static_assert to reject the comparison is the right way to go.
         static_assert(
             program_violates_type_safety_guarantee<T, U>,
-            "mixed signed/unsigned comparison is unsafe - prefer using .ssize() instead of .size(), consider using std::cmp_less instead, or consider explicitly casting one of the values to change signedness by using 'as' or 'cpp2::unsafe_narrow'"
+            "mixed signed/unsigned comparison is unsafe - prefer using .ssize() instead of .size(), consider using std::cmp_less or similar instead, or consider explicitly casting one of the values to change signedness by using 'as' or 'cpp2::unchecked_narrow'"
             );
     }
 }
 
 
-CPP2_FORCE_INLINE constexpr auto cmp_less(auto&& t, auto&& u) -> decltype(auto)
+CPP2_FORCE_INLINE constexpr auto cmp_less(auto&& t, auto&& u) 
+    -> decltype(auto)
     requires requires {CPP2_FORWARD(t) < CPP2_FORWARD(u);}
 {
     cmp_mixed_signedness_check<CPP2_TYPEOF(t), CPP2_TYPEOF(u)>();
     return CPP2_FORWARD(t) < CPP2_FORWARD(u);
 }
 
-CPP2_FORCE_INLINE constexpr auto cmp_less(auto&& t, auto&& u) -> decltype(auto)
+CPP2_FORCE_INLINE constexpr auto cmp_less(auto&& t, auto&& u) 
+    -> decltype(auto)
 {
     static_assert(
         program_violates_type_safety_guarantee<decltype(t), decltype(u)>,
@@ -2693,14 +2829,16 @@ CPP2_FORCE_INLINE constexpr auto cmp_less(auto&& t, auto&& u) -> decltype(auto)
 }
 
 
-CPP2_FORCE_INLINE constexpr auto cmp_less_eq(auto&& t, auto&& u) -> decltype(auto)
+CPP2_FORCE_INLINE constexpr auto cmp_less_eq(auto&& t, auto&& u) 
+    -> decltype(auto)
     requires requires {CPP2_FORWARD(t) <= CPP2_FORWARD(u);}
 {
     cmp_mixed_signedness_check<CPP2_TYPEOF(t), CPP2_TYPEOF(u)>();
     return CPP2_FORWARD(t) <= CPP2_FORWARD(u);
 }
 
-CPP2_FORCE_INLINE constexpr auto cmp_less_eq(auto&& t, auto&& u) -> decltype(auto)
+CPP2_FORCE_INLINE constexpr auto cmp_less_eq(auto&& t, auto&& u) 
+    -> decltype(auto)
 {
     static_assert(
         program_violates_type_safety_guarantee<decltype(t), decltype(u)>,
@@ -2710,14 +2848,16 @@ CPP2_FORCE_INLINE constexpr auto cmp_less_eq(auto&& t, auto&& u) -> decltype(aut
 }
 
 
-CPP2_FORCE_INLINE constexpr auto cmp_greater(auto&& t, auto&& u) -> decltype(auto)
+CPP2_FORCE_INLINE constexpr auto cmp_greater(auto&& t, auto&& u) 
+    -> decltype(auto)
     requires requires {CPP2_FORWARD(t) > CPP2_FORWARD(u);}
 {
     cmp_mixed_signedness_check<CPP2_TYPEOF(t), CPP2_TYPEOF(u)>();
     return CPP2_FORWARD(t) > CPP2_FORWARD(u);
 }
 
-CPP2_FORCE_INLINE constexpr auto cmp_greater(auto&& t, auto&& u) -> decltype(auto)
+CPP2_FORCE_INLINE constexpr auto cmp_greater(auto&& t, auto&& u) 
+    -> decltype(auto)
 {
     static_assert(
         program_violates_type_safety_guarantee<decltype(t), decltype(u)>,
@@ -2727,14 +2867,16 @@ CPP2_FORCE_INLINE constexpr auto cmp_greater(auto&& t, auto&& u) -> decltype(aut
 }
 
 
-CPP2_FORCE_INLINE constexpr auto cmp_greater_eq(auto&& t, auto&& u) -> decltype(auto)
+CPP2_FORCE_INLINE constexpr auto cmp_greater_eq(auto&& t, auto&& u) 
+    -> decltype(auto)
     requires requires {CPP2_FORWARD(t) >= CPP2_FORWARD(u);}
 {
     cmp_mixed_signedness_check<CPP2_TYPEOF(t), CPP2_TYPEOF(u)>();
     return CPP2_FORWARD(t) >= CPP2_FORWARD(u);
 }
 
-CPP2_FORCE_INLINE constexpr auto cmp_greater_eq(auto&& t, auto&& u) -> decltype(auto)
+CPP2_FORCE_INLINE constexpr auto cmp_greater_eq(auto&& t, auto&& u) 
+    -> decltype(auto)
 {
     static_assert(
         program_violates_type_safety_guarantee<decltype(t), decltype(u)>,
@@ -2762,19 +2904,19 @@ CPP2_FORCE_INLINE constexpr auto cmp_greater_eq(auto&& t, auto&& u) -> decltype(
 //-----------------------------------------------------------------------
 //
 template< typename C >
-inline constexpr auto as_( auto&& x ) -> decltype(auto)
+constexpr auto as_( auto&& x ) -> decltype(auto)
 {
     if constexpr (is_narrowing_v<C, CPP2_TYPEOF(x)>) {
         static_assert(
             program_violates_type_safety_guarantee<C, CPP2_TYPEOF(x)>,
-            "'as' does not allow unsafe possibly-lossy narrowing conversions - if you're sure you want this, use 'unsafe_narrow<T>' to explicitly force the conversion and possibly lose information"
+            "'as' does not allow unsafe possibly-lossy narrowing conversions - if you're sure you want this, use 'unchecked_narrow<T>' to explicitly force the conversion and possibly lose information"
         );
     }
     else if constexpr (is_unsafe_pointer_conversion_v<C, CPP2_TYPEOF(x)>)
     {
         static_assert(
             program_violates_type_safety_guarantee<C, CPP2_TYPEOF(x)>,
-            "'as' does not allow unsafe pointer conversions - if you're sure you want this, use `unsafe_cast<T>()` to explicitly force the unsafe cast"
+            "'as' does not allow unsafe pointer conversions - if you're sure you want this, use `unchecked_cast<T>()` to explicitly force the cast"
             );
     }
     else if constexpr( std::is_same_v< CPP2_TYPEOF(as<C>(CPP2_FORWARD(x))), nonesuch_ > ) {
@@ -2788,13 +2930,13 @@ inline constexpr auto as_( auto&& x ) -> decltype(auto)
 }
 
 template< typename C, auto x >
-inline constexpr auto as_() -> decltype(auto)
+constexpr auto as_() -> decltype(auto)
 {
     if constexpr (requires { as<C, x>(); }) {
         if constexpr( std::is_same_v< CPP2_TYPEOF((as<C, x>())), nonesuch_ > ) {
             static_assert(
                 program_violates_type_safety_guarantee<C, CPP2_TYPEOF(x)>,
-                "'as' does not allow unsafe possibly-lossy narrowing conversions - if you're sure you want this, use `unsafe_narrow<T>()` to explicitly force the conversion and possibly lose information"
+                "'as' does not allow unsafe possibly-lossy narrowing conversions - if you're sure you want this, use `unchecked_narrow<T>()` to explicitly force the conversion and possibly lose information"
                 );
         }
     }
@@ -2812,8 +2954,6 @@ inline constexpr auto as_() -> decltype(auto)
 
 
 }
-
-#include "cpp2regex.h"
 
 using cpp2::cpp2_new;
 
@@ -2833,4 +2973,9 @@ using cpp2::cpp2_new;
     #define CPP2_REQUIRES_(...) requires (__VA_ARGS__)
 #endif
 
+//  Restore clang signed-to-unsigned conversion warnings
+#ifdef __clang__
+    #pragma clang diagnostic pop
 #endif
+
+#endif // CPP2_CPP2UTIL_H

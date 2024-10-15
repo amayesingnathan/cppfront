@@ -29,7 +29,7 @@ pi: <T: type> T == 3.14159'26535'89793'23846L;
 pi: _ == 3.14159'26535'89793'23846L;    // same, deducing the object's type
 ```
 
-The parameter type can be deduced by writing `_` (the default, so it can be omitted). You can use `is` to declare a type constraint (e.g., a concept) that a deduced type must match, in which case `_` is required. For example:
+The object type can be deduced by writing `_` (the default, so it can be omitted). You can use `is` to declare a type constraint (e.g., a concept) that a deduced type must match, in which case `_` is required. For example:
 
 ``` cpp title="Declaring an object of constrained deduced type" hl_lines="2"
 //  number's type is deduced, but must match the std::regular concept
@@ -64,9 +64,9 @@ shape: type = {
 
 Additionally, at function local scope an object `obj` can be initialized separately from its declaration. This can be useful when the object must be declared before a program-meaningful initial value is known (to avoid a dead write of a wrong 'dummy' value), and/or when the object may be initialized in more than one way depending on other logic (e.g., by using different constructors on different paths). The way to do this is:
 
-- Declare `obj` without an initializer, such as `obj: some_type;`. This allocates stack space for the object, but does not construct it.
+- Declare `obj` without an `= initializer` value, for example: `obj: some_type;`. This allocates stack space for the object, but does not construct it.
 
-- `obj` must have a definite first use on every `#!cpp if`/`#!cpp else` branch path, and
+- `obj` must have a definite first use on every `#!cpp if`/`#!cpp else` branch path (and that first use must not be inside any loop), and
 
 - that definite first use must be of the form `obj = value;` which is a constructor call, or else pass `obj` as an `out` argument to an `out` parameter (which is also effectively a constructor call, and performs the construction in the callee).
 
@@ -79,7 +79,7 @@ f: () = {
     //  ...  no uses of buf here  ...
     buf = some_calculated_value;        // constructs (not assigns) buf
     //  ...
-    std::cout buf[0];                   // ok, a has been initialized
+    std::cout << buf[0];                // ok, a has been initialized
 }
 
 g: () = {
